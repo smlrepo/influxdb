@@ -2,6 +2,7 @@
 package retention // import "github.com/influxdata/influxdb/services/retention"
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -94,9 +95,23 @@ func (s *Service) run() {
 			// have to do it manually.
 			var retryNeeded bool
 			dbs := s.MetaClient.Databases()
+
+			buf, _ := json.Marshal(dbs)
+			log.Info("metadata", zap.String("json", string(buf)))
+			log.Info("meta databases", zap.Int("n", len(dbs)))
+
 			for _, d := range dbs {
+				log.Info("meta database", zap.String("name", d.Name), zap.Int("rps", len(d.RetentionPolicies)))
+
 				for _, r := range d.RetentionPolicies {
+					log.Info("meta policy", zap.String("name", r.Name), zap.Int("groups", len(r.ShardGroups)), zap.Int("expired-groups", len(r.ExpiredShardGroups(time.Now().UTC()))))
+					for _, g := range r.ShardGroups {
+						log.Info("meta group", zap.Uint64("id", g.ID))
+					}
+
 					for _, g := range r.ExpiredShardGroups(time.Now().UTC()) {
+						log.Info("expired meta group", zap.Uint64("id", g.ID), zap.String("db", d.Name), zap.String("rp", r.Name))
+
 						if err := s.MetaClient.DeleteShardGroup(d.Name, r.Name, g.ID); err != nil {
 							log.Info("Failed to delete shard group",
 								logger.Database(d.Name),
@@ -113,7 +128,9 @@ func (s *Service) run() {
 							logger.RetentionPolicy(r.Name))
 
 						// Store all the shard IDs that may possibly need to be removed locally.
+						log.Info("delete shards", zap.Int("n", len(g.Shards)))
 						for _, sh := range g.Shards {
+							log.Info("delete id", zap.Uint64("id", sh.ID))
 							deletedShardIDs[sh.ID] = deletionInfo{db: d.Name, rp: r.Name}
 						}
 					}
@@ -121,8 +138,11 @@ func (s *Service) run() {
 			}
 
 			// Remove shards if we store them locally
+			log.Info("local shard ids", zap.Uint64s("ids", s.TSDBStore.ShardIDs()))
 			for _, id := range s.TSDBStore.ShardIDs() {
+				log.Info("local shard ids", zap.Uint64("id", id))
 				if info, ok := deletedShardIDs[id]; ok {
+					log.Info("delete local shard", zap.Uint64("id", id))
 					if err := s.TSDBStore.DeleteShard(id); err != nil {
 						log.Info("Failed to delete shard",
 							logger.Database(info.db),
@@ -138,6 +158,7 @@ func (s *Service) run() {
 						logger.RetentionPolicy(info.rp))
 				}
 			}
+			log.Info("local shards done")
 
 			if err := s.MetaClient.PruneShardGroups(); err != nil {
 				log.Info("Problem pruning shard groups", zap.Error(err))
