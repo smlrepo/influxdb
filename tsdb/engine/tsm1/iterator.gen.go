@@ -270,7 +270,12 @@ func (itr *floatIterator) Next() (*query.FloatPoint, error) {
 		}
 
 		// Evaluate condition, if one exists. Retry if it fails.
-		if itr.opt.Condition != nil && !influxql.EvalBool(itr.opt.Condition, itr.m) {
+		valuer := influxql.ValuerEval{
+			Valuer: &query.MathValuer{
+				Valuer: influxql.MapValuer(itr.m),
+			},
+		}
+		if itr.opt.Condition != nil && !valuer.EvalBool(itr.opt.Condition) {
 			continue
 		}
 
@@ -742,7 +747,12 @@ func (itr *integerIterator) Next() (*query.IntegerPoint, error) {
 		}
 
 		// Evaluate condition, if one exists. Retry if it fails.
-		if itr.opt.Condition != nil && !influxql.EvalBool(itr.opt.Condition, itr.m) {
+		valuer := influxql.ValuerEval{
+			Valuer: &query.MathValuer{
+				Valuer: influxql.MapValuer(itr.m),
+			},
+		}
+		if itr.opt.Condition != nil && !valuer.EvalBool(itr.opt.Condition) {
 			continue
 		}
 
@@ -1214,7 +1224,12 @@ func (itr *unsignedIterator) Next() (*query.UnsignedPoint, error) {
 		}
 
 		// Evaluate condition, if one exists. Retry if it fails.
-		if itr.opt.Condition != nil && !influxql.EvalBool(itr.opt.Condition, itr.m) {
+		valuer := influxql.ValuerEval{
+			Valuer: &query.MathValuer{
+				Valuer: influxql.MapValuer(itr.m),
+			},
+		}
+		if itr.opt.Condition != nil && !valuer.EvalBool(itr.opt.Condition) {
 			continue
 		}
 
@@ -1686,7 +1701,12 @@ func (itr *stringIterator) Next() (*query.StringPoint, error) {
 		}
 
 		// Evaluate condition, if one exists. Retry if it fails.
-		if itr.opt.Condition != nil && !influxql.EvalBool(itr.opt.Condition, itr.m) {
+		valuer := influxql.ValuerEval{
+			Valuer: &query.MathValuer{
+				Valuer: influxql.MapValuer(itr.m),
+			},
+		}
+		if itr.opt.Condition != nil && !valuer.EvalBool(itr.opt.Condition) {
 			continue
 		}
 
@@ -2158,7 +2178,12 @@ func (itr *booleanIterator) Next() (*query.BooleanPoint, error) {
 		}
 
 		// Evaluate condition, if one exists. Retry if it fails.
-		if itr.opt.Condition != nil && !influxql.EvalBool(itr.opt.Condition, itr.m) {
+		valuer := influxql.ValuerEval{
+			Valuer: &query.MathValuer{
+				Valuer: influxql.MapValuer(itr.m),
+			},
+		}
+		if itr.opt.Condition != nil && !valuer.EvalBool(itr.opt.Condition) {
 			continue
 		}
 

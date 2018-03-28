@@ -268,7 +268,12 @@ func (itr *{{.name}}Iterator) Next() (*query.{{.Name}}Point, error) {
 		}
 
 		// Evaluate condition, if one exists. Retry if it fails.
-		if itr.opt.Condition != nil && !influxql.EvalBool(itr.opt.Condition, itr.m) {
+		valuer := influxql.ValuerEval{
+			Valuer: &query.MathValuer{
+				Valuer: influxql.MapValuer(itr.m),
+			},
+		}
+		if itr.opt.Condition != nil && !valuer.EvalBool(itr.opt.Condition) {
 			continue
 		}
 
