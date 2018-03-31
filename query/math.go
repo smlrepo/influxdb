@@ -52,7 +52,11 @@ func (v *MathValuer) Call(name string, args []influxql.Expr) (interface{}, bool)
 		}
 	}
 	if v, ok := v.Valuer.(influxql.CallValuer); ok {
-		return v.Call(name, args)
+		callArgs := make([]interface{}, len(args))
+		for i, arg := range args {
+			callArgs[i] = arg
+		}
+		return v.Call(name, callArgs)
 	}
 	return nil, false
 }
