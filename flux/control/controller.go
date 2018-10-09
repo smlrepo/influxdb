@@ -6,8 +6,8 @@ import (
 	_ "github.com/influxdata/flux/builtin"
 	"github.com/influxdata/flux/control"
 	"github.com/influxdata/flux/execute"
-	"github.com/influxdata/flux/functions"
-	fstorage "github.com/influxdata/flux/functions/input/storage"
+	"github.com/influxdata/flux/functions/inputs"
+	fstorage "github.com/influxdata/flux/functions/inputs/storage"
 	"github.com/influxdata/influxdb/flux/functions/store"
 	"github.com/influxdata/influxdb/services/storage"
 	"github.com/influxdata/platform"
@@ -29,7 +29,7 @@ func NewController(s storage.Store, logger *zap.Logger) *control.Controller {
 		Verbose:              false,
 	}
 
-	err := functions.InjectFromDependencies(cc.ExecutorDependencies, fstorage.Dependencies{
+	err := inputs.InjectFromDependencies(cc.ExecutorDependencies, fstorage.Dependencies{
 		Reader:             store.NewReader(s),
 		BucketLookup:       bucketLookup{},
 		OrganizationLookup: orgLookup{},
