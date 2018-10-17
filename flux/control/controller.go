@@ -6,9 +6,6 @@ import (
 	_ "github.com/influxdata/flux/builtin"
 	"github.com/influxdata/flux/control"
 	"github.com/influxdata/flux/execute"
-	"github.com/influxdata/flux/functions/inputs"
-	fstorage "github.com/influxdata/flux/functions/inputs/storage"
-	"github.com/influxdata/influxdb/flux/functions/store"
 	"github.com/influxdata/influxdb/services/storage"
 	"github.com/influxdata/platform"
 	"go.uber.org/zap"
@@ -29,25 +26,25 @@ func NewController(s storage.Store, logger *zap.Logger) *control.Controller {
 		Verbose:              false,
 	}
 
-	err := inputs.InjectFromDependencies(cc.ExecutorDependencies, fstorage.Dependencies{
-		Reader:             store.NewReader(s),
-		BucketLookup:       bucketLookup{},
-		OrganizationLookup: orgLookup{},
-	})
-	if err != nil {
-		panic(err)
-	}
 	return control.New(cc)
 }
 
 type orgLookup struct{}
 
+func mustIDFromString(name string) platform.ID {
+	id, err := platform.IDFromString(name)
+	if err != nil {
+		panic(err)
+	}
+	return *id
+}
+
 func (l orgLookup) Lookup(ctx context.Context, name string) (platform.ID, bool) {
-	return platform.ID(name), true
+	return mustIDFromString(name), true
 }
 
 type bucketLookup struct{}
 
 func (l bucketLookup) Lookup(orgID platform.ID, name string) (platform.ID, bool) {
-	return platform.ID(name), true
+	return mustIDFromString(name), true
 }
