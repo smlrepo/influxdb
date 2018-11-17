@@ -37,7 +37,7 @@ func (bd *BucketsDecoder) Decode() (flux.Table, error) {
 		return nil, err
 	}
 
-	b := execute.NewColListTableBuilder(gk, bd.alloc)
+	b := execute.NewColListTableBuilder(gk, bd.alloc.Allocator)
 
 	b.AddCol(flux.ColMeta{
 		Label: "name",
@@ -87,7 +87,9 @@ func createBucketsSource(prSpec plan.ProcedureSpec, dsid execute.DatasetID, a ex
 	// so there's no need to inject custom dependencies for buckets()
 	deps := a.Dependencies()[inputs.BucketsKind].(BucketDependencies)
 
-	bd := &BucketsDecoder{deps: deps, alloc: a.Allocator()}
+	bd := &BucketsDecoder{deps: deps, alloc: &execute.Allocator{
+		Allocator: a.Allocator(),
+	}}
 
 	return inputs.CreateSourceFromDecoder(bd, dsid, a)
 
