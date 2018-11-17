@@ -1,17 +1,17 @@
 package control
 
 import (
-	"context"
-
-	_ "github.com/influxdata/flux/builtin"
 	"github.com/influxdata/flux/control"
 	"github.com/influxdata/flux/execute"
-	"github.com/influxdata/influxdb/services/storage"
-	"github.com/influxdata/platform"
+	_ "github.com/influxdata/influxdb/flux/builtin"
+	"github.com/influxdata/influxdb/flux/functions/inputs"
+	fstorage "github.com/influxdata/platform/query/functions/inputs/storage"
 	"go.uber.org/zap"
 )
 
-func NewController(s storage.Store, logger *zap.Logger) *control.Controller {
+type MetaClient = inputs.MetaClient
+
+func NewController(mc MetaClient, reader fstorage.Reader, logger *zap.Logger) *control.Controller {
 	// flux
 	var (
 		concurrencyQuota = 10
@@ -26,25 +26,15 @@ func NewController(s storage.Store, logger *zap.Logger) *control.Controller {
 		Verbose:              false,
 	}
 
-	return control.New(cc)
-}
-
-type orgLookup struct{}
-
-func mustIDFromString(name string) platform.ID {
-	id, err := platform.IDFromString(name)
+	err := inputs.InjectFromDependencies(cc.ExecutorDependencies, inputs.Dependencies{Reader: reader})
 	if err != nil {
 		panic(err)
 	}
-	return *id
-}
 
-func (l orgLookup) Lookup(ctx context.Context, name string) (platform.ID, bool) {
-	return mustIDFromString(name), true
-}
+	err = inputs.InjectBucketDependencies(cc.ExecutorDependencies, mc)
+	if err != nil {
+		panic(err)
+	}
 
-type bucketLookup struct{}
-
-func (l bucketLookup) Lookup(orgID platform.ID, name string) (platform.ID, bool) {
-	return mustIDFromString(name), true
+	return control.New(cc)
 }

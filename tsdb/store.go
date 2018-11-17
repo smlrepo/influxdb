@@ -660,6 +660,11 @@ func (s *Store) DeleteShard(shardID uint64) error {
 	}
 	delete(s.shards, shardID)
 	s.pendingShardDeletes[shardID] = struct{}{}
+
+	db := sh.Database()
+	// Determine if the shard contained any series that are not present in any
+	// other shards in the database.
+	shards := s.filterShards(byDatabase(db))
 	s.mu.Unlock()
 
 	// Ensure the pending deletion flag is cleared on exit.
@@ -676,12 +681,6 @@ func (s *Store) DeleteShard(shardID uint64) error {
 	}
 
 	ss := index.SeriesIDSet()
-
-	db := sh.Database()
-
-	// Determine if the shard contained any series that are not present in any
-	// other shards in the database.
-	shards := s.filterShards(byDatabase(db))
 
 	s.walkShards(shards, func(sh *Shard) error {
 		index, err := sh.Index()
@@ -880,6 +879,7 @@ func (s *Store) DeleteMeasurement(database, name string) error {
 
 // filterShards returns a slice of shards where fn returns true
 // for the shard. If the provided predicate is nil then all shards are returned.
+// filterShards should be called under a lock.
 func (s *Store) filterShards(fn func(sh *Shard) bool) []*Shard {
 	var shards []*Shard
 	if fn == nil {
@@ -1404,10 +1404,20 @@ func (s *Store) TagKeys(auth query.Authorizer, shardIDs []uint64, cond influxql.
 		}
 
 		if is.SeriesFile == nil {
-			is.SeriesFile = shard.sfile
+			sfile, err := shard.SeriesFile()
+			if err != nil {
+				s.mu.RUnlock()
+				return nil, err
+			}
+			is.SeriesFile = sfile
 		}
 
-		is.Indexes = append(is.Indexes, shard.index)
+		index, err := shard.Index()
+		if err != nil {
+			s.mu.RUnlock()
+			return nil, err
+		}
+		is.Indexes = append(is.Indexes, index)
 	}
 	s.mu.RUnlock()
 
@@ -1560,9 +1570,21 @@ func (s *Store) TagValues(auth query.Authorizer, shardIDs []uint64, cond influxq
 		}
 
 		if is.SeriesFile == nil {
-			is.SeriesFile = shard.sfile
+			sfile, err := shard.SeriesFile()
+			if err != nil {
+				s.mu.RUnlock()
+				return nil, err
+			}
+			is.SeriesFile = sfile
 		}
-		is.Indexes = append(is.Indexes, shard.index)
+
+		index, err := shard.Index()
+		if err != nil {
+			s.mu.RUnlock()
+			return nil, err
+		}
+
+		is.Indexes = append(is.Indexes, index)
 	}
 	s.mu.RUnlock()
 	is = is.DedupeInmemIndexes()

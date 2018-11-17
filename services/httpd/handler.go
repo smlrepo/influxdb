@@ -25,7 +25,6 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	"github.com/influxdata/flux"
-	"github.com/influxdata/flux/control"
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/logger"
 	"github.com/influxdata/influxdb/models"
@@ -35,11 +34,12 @@ import (
 	"github.com/influxdata/influxdb/prometheus/remote"
 	"github.com/influxdata/influxdb/query"
 	"github.com/influxdata/influxdb/services/meta"
-	"github.com/influxdata/influxdb/services/storage"
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxdb/uuid"
 	"github.com/influxdata/influxql"
-	pquery "github.com/influxdata/platform/query"
+	"github.com/influxdata/platform/storage/reads"
+	"github.com/influxdata/platform/storage/reads/datatypes"
+	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
@@ -116,14 +116,16 @@ type Handler struct {
 	Store Store
 
 	// Flux services
-	Controller       *control.Controller
+	Controller       Controller
 	CompilerMappings flux.CompilerMappings
+	registered       bool
 
-	Config    *Config
-	Logger    *zap.Logger
-	CLFLogger *log.Logger
-	accessLog *os.File
-	stats     *Statistics
+	Config           *Config
+	Logger           *zap.Logger
+	CLFLogger        *log.Logger
+	accessLog        *os.File
+	accessLogFilters StatusFilters
+	stats            *Statistics
 
 	requestTracker *RequestTracker
 	writeThrottler *Throttler
@@ -179,10 +181,6 @@ func NewHandler(c Config) *Handler {
 			"prometheus-read", // Prometheus remote read
 			"POST", "/api/v1/prom/read", true, true, h.servePromRead,
 		},
-		Route{
-			"flux-read", // Prometheus remote read
-			"POST", "/v2/query", true, true, h.serveFluxQuery,
-		},
 		Route{ // Ping
 			"ping",
 			"GET", "/ping", false, true, h.servePing,
@@ -205,6 +203,20 @@ func NewHandler(c Config) *Handler {
 		},
 	}...)
 
+	fluxRoute := Route{
+		"flux-read",
+		"POST", "/api/v2/query", true, true, nil,
+	}
+
+	if !c.FluxEnabled {
+		fluxRoute.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Flux query service disabled. Verify flux-enabled=true in the [http] section of the InfluxDB config.", http.StatusForbidden)
+		}
+	} else {
+		fluxRoute.HandlerFunc = h.serveFluxQuery
+	}
+	h.AddRoutes(fluxRoute)
+
 	return h
 }
 
@@ -224,12 +236,26 @@ func (h *Handler) Open() {
 		}
 		h.Logger.Info("opened HTTP access log", zap.String("path", path))
 	}
+	h.accessLogFilters = StatusFilters(h.Config.AccessLogStatusFilters)
+
+	if h.Config.FluxEnabled {
+		h.registered = true
+		prom.MustRegister(h.Controller.PrometheusCollectors()...)
+	}
 }
 
 func (h *Handler) Close() {
 	if h.accessLog != nil {
 		h.accessLog.Close()
 		h.accessLog = nil
+		h.accessLogFilters = nil
+	}
+
+	if h.registered {
+		for _, col := range h.Controller.PrometheusCollectors() {
+			prom.Unregister(col)
+		}
+		h.registered = false
 	}
 }
 
@@ -257,6 +283,8 @@ type Statistics struct {
 	RecoveredPanics              int64
 	PromWriteRequests            int64
 	PromReadRequests             int64
+	FluxQueryRequests            int64
+	FluxQueryRequestDuration     int64
 }
 
 // Statistics returns statistics for periodic monitoring.
@@ -286,6 +314,8 @@ func (h *Handler) Statistics(tags map[string]string) []models.Statistic {
 			statRecoveredPanics:              atomic.LoadInt64(&h.stats.RecoveredPanics),
 			statPromWriteRequest:             atomic.LoadInt64(&h.stats.PromWriteRequests),
 			statPromReadRequest:              atomic.LoadInt64(&h.stats.PromReadRequests),
+			statFluxQueryRequests:            atomic.LoadInt64(&h.stats.FluxQueryRequests),
+			statFluxQueryRequestDuration:     atomic.LoadInt64(&h.stats.FluxQueryRequestDuration),
 		},
 	}}
 }
@@ -1112,7 +1142,10 @@ func (h *Handler) servePromRead(w http.ResponseWriter, r *http.Request, user met
 }
 
 func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	atomic.AddInt64(&h.stats.FluxQueryRequests, 1)
+	defer func(start time.Time) {
+		atomic.AddInt64(&h.stats.FluxQueryRequestDuration, time.Since(start).Nanoseconds())
+	}(time.Now())
 
 	req, err := decodeQueryRequest(r)
 	if err != nil {
@@ -1121,8 +1154,7 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pr := req.ProxyRequest()
-	ctx = pquery.ContextWithRequest(ctx, &pr.Request)
-	q, err := h.Controller.Query(ctx, pr.Request.Compiler)
+	q, err := h.Controller.Query(r.Context(), pr.Compiler)
 	if err != nil {
 		h.httpError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1149,7 +1181,6 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request) {
 	case "text/csv":
 		fallthrough
 	default:
-
 		if hd, ok := pr.Dialect.(httpDialect); !ok {
 			h.httpError(w, fmt.Sprintf("unsupported dialect over HTTP %T", req.Dialect), http.StatusBadRequest)
 			return
@@ -1623,7 +1654,10 @@ func (h *Handler) logging(inner http.Handler, name string) http.Handler {
 		start := time.Now()
 		l := &responseLogger{w: w}
 		inner.ServeHTTP(l, r)
-		h.CLFLogger.Println(buildLogLine(l, r, start))
+
+		if h.accessLogFilters.Match(l.Status()) {
+			h.CLFLogger.Println(buildLogLine(l, r, start))
+		}
 
 		// Log server errors.
 		if l.Status()/100 == 5 {
@@ -1681,8 +1715,7 @@ func (h *Handler) recovery(inner http.Handler, name string) http.Handler {
 
 // Store describes the behaviour of the storage packages Store type.
 type Store interface {
-	Read(ctx context.Context, req *storage.ReadRequest) (storage.ResultSet, error)
-	WithLogger(log *zap.Logger)
+	Read(ctx context.Context, req *datatypes.ReadRequest) (reads.ResultSet, error)
 }
 
 // Response represents a list of statement results.
