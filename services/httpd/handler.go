@@ -1191,7 +1191,7 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request) {
 		results := flux.NewResultIteratorFromQuery(q)
 		n, err := encoder.Encode(w, results)
 		if err != nil {
-			results.Cancel()
+			results.Release()
 			if n == 0 {
 				// If the encoder did not write anything, we can write an error header.
 				h.httpError(w, err.Error(), http.StatusInternalServerError)
