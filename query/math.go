@@ -206,13 +206,6 @@ func (v MathValuer) Call(name string, args []interface{}) (interface{}, bool) {
 			return nil, true
 		}
 	}
-	if v, ok := v.Valuer.(influxql.CallValuer); ok {
-		callArgs := make([]interface{}, len(args))
-		for i, arg := range args {
-			callArgs[i] = arg
-		}
-		return v.Call(name, callArgs)
-	}
 	return nil, false
 }
 
