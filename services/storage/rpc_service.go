@@ -3,33 +3,29 @@ package storage
 import (
 	"context"
 	"errors"
-	"fmt"
-	"math"
 	"strings"
 
 	"github.com/gogo/protobuf/types"
+	"github.com/influxdata/influxdb/logger"
 	"github.com/influxdata/influxdb/pkg/metrics"
-	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 	"go.uber.org/zap"
 )
 
-//go:generate protoc -I$GOPATH/src/github.com/influxdata/influxdb/vendor -I. --plugin=protoc-gen-yarpc=$GOPATH/bin/protoc-gen-yarpc --yarpc_out=Mgoogle/protobuf/empty.proto=github.com/gogo/protobuf/types:. --gogofaster_out=Mgoogle/protobuf/empty.proto=github.com/gogo/protobuf/types:. storage.proto predicate.proto
-//go:generate tmpl -data=@batch_cursor.gen.go.tmpldata batch_cursor.gen.go.tmpl
-//go:generate tmpl -data=@batch_cursor.gen.go.tmpldata response_writer.gen.go.tmpl
+//go:generate protoc -I$GOPATH/src/github.com/influxdata/influxdb/vendor -I. --gogofaster_out=Mgoogle/protobuf/empty.proto=github.com/gogo/protobuf/types,Mgoogle/protobuf/any.proto=github.com/gogo/protobuf/types,plugins=grpc:. storage_common.proto storage.proto predicate.proto
+//go:generate tmpl -data=@array_cursor.gen.go.tmpldata array_cursor.gen.go.tmpl
+//go:generate tmpl -data=@array_cursor.gen.go.tmpldata response_writer.gen.go.tmpl
 
-const (
-	batchSize  = 1000
-	frameCount = 50
-	writeSize  = 64 << 10 // 64k
+var (
+	ErrMissingReadSource = errors.New("missing ReadSource")
 )
 
 type rpcService struct {
 	loggingEnabled bool
 
-	Store  *Store
+	Store  Store
 	Logger *zap.Logger
 }
 
@@ -42,118 +38,133 @@ func (r *rpcService) Hints(context.Context, *types.Empty) (*HintsResponse, error
 }
 
 func (r *rpcService) Read(req *ReadRequest, stream Storage_ReadServer) error {
-	// TODO(sgc): implement frameWriter that handles the details of streaming frames
-	var err error
-	var wire opentracing.SpanContext
-
-	if len(req.Trace) > 0 {
-		wire, _ = opentracing.GlobalTracer().Extract(opentracing.TextMap, opentracing.TextMapCarrier(req.Trace))
-		// TODO(sgc): Log ignored error?
+	source, err := getReadSource(req)
+	if err != nil {
+		return err
 	}
 
-	span := opentracing.StartSpan("storage.read", ext.RPCServerOption(wire))
-	defer span.Finish()
-
-	ext.DBInstance.Set(span, req.Database)
-
-	// TODO(sgc): use yarpc stream.Context() once implemented
-	ctx := context.Background()
-	ctx = opentracing.ContextWithSpan(ctx, span)
 	// TODO(sgc): this should be available via a generic API, such as tsdb.Store
-	ctx = tsm1.NewContextWithMetricsGroup(ctx)
+	ctx := tsm1.NewContextWithMetricsGroup(stream.Context())
 
 	var agg Aggregate_AggregateType
 	if req.Aggregate != nil {
 		agg = req.Aggregate.Type
 	}
 	pred := truncateString(PredicateToExprString(req.Predicate))
-	groupKeys := truncateString(strings.Join(req.Grouping, ","))
-	span.
-		SetTag("predicate", pred).
-		SetTag("series_limit", req.SeriesLimit).
-		SetTag("series_offset", req.SeriesOffset).
-		SetTag("points_limit", req.PointsLimit).
-		SetTag("start", req.TimestampRange.Start).
-		SetTag("end", req.TimestampRange.End).
-		SetTag("desc", req.Descending).
-		SetTag("group_keys", groupKeys).
-		SetTag("aggregate", agg.String())
+	groupKeys := truncateString(strings.Join(req.GroupKeys, ","))
+
+	span := opentracing.SpanFromContext(ctx)
+	if span != nil {
+		span.
+			SetTag(string(ext.DBInstance), source.Database).
+			SetTag("rp", source.RetentionPolicy).
+			SetTag("predicate", pred).
+			SetTag("series_limit", req.SeriesLimit).
+			SetTag("series_offset", req.SeriesOffset).
+			SetTag("points_limit", req.PointsLimit).
+			SetTag("start", req.TimestampRange.Start).
+			SetTag("end", req.TimestampRange.End).
+			SetTag("desc", req.Descending).
+			SetTag("group", req.Group.String()).
+			SetTag("group_keys", groupKeys).
+			SetTag("aggregate", agg.String())
+	}
+
+	log, logEnd := logger.NewOperation(r.Logger, "Read", "storage_read")
+	defer logEnd()
+	ctx = logger.NewContextWithLogger(ctx, log)
 
 	if r.loggingEnabled {
-		r.Logger.Info("request",
-			zap.String("database", req.Database),
+		log.Info("Read request info",
+			zap.String("database", source.Database),
+			zap.String("rp", source.RetentionPolicy),
 			zap.String("predicate", pred),
-			zap.Uint64("series_limit", req.SeriesLimit),
-			zap.Uint64("series_offset", req.SeriesOffset),
-			zap.Uint64("points_limit", req.PointsLimit),
+			zap.String("hints", req.Hints.String()),
+			zap.Int64("series_limit", req.SeriesLimit),
+			zap.Int64("series_offset", req.SeriesOffset),
+			zap.Int64("points_limit", req.PointsLimit),
 			zap.Int64("start", req.TimestampRange.Start),
 			zap.Int64("end", req.TimestampRange.End),
 			zap.Bool("desc", req.Descending),
+			zap.String("group", req.Group.String()),
 			zap.String("group_keys", groupKeys),
 			zap.String("aggregate", agg.String()),
 		)
 	}
 
-	if req.PointsLimit == 0 {
-		req.PointsLimit = math.MaxUint64
+	w := NewResponseWriter(stream, req.Hints)
+
+	switch req.Group {
+	case GroupBy, GroupExcept:
+		if len(req.GroupKeys) == 0 {
+			return errors.New("read: GroupKeys must not be empty when GroupBy or GroupExcept specified")
+		}
+	case GroupNone, GroupAll:
+		if len(req.GroupKeys) > 0 {
+			return errors.New("read: GroupKeys must be empty when GroupNone or GroupAll specified")
+		}
+	default:
+		return errors.New("read: unexpected value for Group")
 	}
 
+	if req.Group == GroupAll {
+		r.handleRead(ctx, req, w, log)
+	} else {
+		r.handleGroupRead(ctx, req, w, log)
+	}
+
+	if r.loggingEnabled {
+		log.Info("Read completed", zap.Int("num_values", w.WrittenN()))
+	}
+
+	if span != nil {
+		span.SetTag("num_values", w.WrittenN())
+		grp := tsm1.MetricsGroupFromContext(ctx)
+		grp.ForEach(func(v metrics.Metric) {
+			switch m := v.(type) {
+			case *metrics.Counter:
+				span.SetTag(m.Name(), m.Value())
+			}
+		})
+	}
+
+	return nil
+}
+
+func (r *rpcService) handleRead(ctx context.Context, req *ReadRequest, w *ResponseWriter, log *zap.Logger) {
 	rs, err := r.Store.Read(ctx, req)
 	if err != nil {
-		r.Logger.Error("Store.Read failed", zap.Error(err))
-		return err
+		log.Error("Read failed", zap.Error(w.Err()))
+		return
 	}
 
 	if rs == nil {
-		return nil
+		return
 	}
 	defer rs.Close()
+	w.WriteResultSet(rs)
+	w.Flush()
 
-	w := &responseWriter{
-		stream: stream,
-		res:    &ReadResponse{Frames: make([]ReadResponse_Frame, 0, frameCount)},
-		logger: r.Logger,
+	if w.Err() != nil {
+		log.Error("Write failed", zap.Error(w.Err()))
+	}
+}
+
+func (r *rpcService) handleGroupRead(ctx context.Context, req *ReadRequest, w *ResponseWriter, log *zap.Logger) {
+	rs, err := r.Store.GroupRead(ctx, req)
+	if err != nil {
+		log.Error("GroupRead failed", zap.Error(w.Err()))
+		return
 	}
 
-	for rs.Next() {
-		cur := rs.Cursor()
-		if cur == nil {
-			// no data for series key + field combination
-			continue
-		}
-
-		w.startSeries(rs.Tags())
-
-		switch cur := cur.(type) {
-		case tsdb.IntegerBatchCursor:
-			w.streamIntegerPoints(cur)
-		case tsdb.FloatBatchCursor:
-			w.streamFloatPoints(cur)
-		case tsdb.UnsignedBatchCursor:
-			w.streamUnsignedPoints(cur)
-		case tsdb.BooleanBatchCursor:
-			w.streamBooleanPoints(cur)
-		case tsdb.StringBatchCursor:
-			w.streamStringPoints(cur)
-		default:
-			panic(fmt.Sprintf("unreachable: %T", cur))
-		}
-
-		if w.err != nil {
-			return w.err
-		}
+	if rs == nil {
+		return
 	}
+	defer rs.Close()
+	w.WriteGroupResultSet(rs)
+	w.Flush()
 
-	w.flushFrames()
-
-	span.SetTag("num_values", w.vc)
-	grp := tsm1.MetricsGroupFromContext(ctx)
-	grp.ForEach(func(v metrics.Metric) {
-		switch m := v.(type) {
-		case *metrics.Counter:
-			span.SetTag(m.Name(), m.Value())
-		}
-	})
-
-	return nil
+	if w.Err() != nil {
+		log.Error("Write failed", zap.Error(w.Err()))
+	}
 }

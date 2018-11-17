@@ -25,7 +25,13 @@ func NodeToExpr(node *Node, remap map[string]string) (influxql.Expr, error) {
 		return nil, nil
 	}
 
-	return v.exprs[0], nil
+	// TODO(edd): It would be preferable if RewriteRegexConditions was a
+	// package level function in influxql.
+	stmt := &influxql.SelectStatement{
+		Condition: v.exprs[0],
+	}
+	stmt.RewriteRegexConditions()
+	return stmt.Condition, nil
 }
 
 type nodeToExprVisitor struct {
@@ -133,7 +139,7 @@ func (v *nodeToExprVisitor) Visit(n *Node) NodeVisitor {
 			}
 		}
 
-		v.exprs = append(v.exprs, &influxql.VarRef{Val: ref})
+		v.exprs = append(v.exprs, &influxql.VarRef{Val: ref, Type: influxql.Tag})
 		return nil
 
 	case NodeTypeFieldRef:
@@ -236,8 +242,58 @@ func (v *hasRefs) Visit(node influxql.Node) influxql.Visitor {
 	return v
 }
 
+// HasSingleMeasurementNoOR determines if an index optimisation is available.
+//
+// Typically the read service will use the query engine to retrieve all field
+// keys for all measurements that match the expression, which can be very
+// inefficient if it can be proved that only one measurement matches the expression.
+//
+// This condition is determined when the following is true:
+//
+//		* there is only one occurrence of the tag key `_measurement`.
+//		* there are no OR operators in the expression tree.
+//		* the operator for the `_measurement` binary expression is ==.
+//
+func HasSingleMeasurementNoOR(expr influxql.Expr) (string, bool) {
+	var lastMeasurement string
+	foundOnce := true
+	var invalidOP bool
+
+	influxql.WalkFunc(expr, func(node influxql.Node) {
+		if !foundOnce || invalidOP {
+			return
+		}
+
+		if be, ok := node.(*influxql.BinaryExpr); ok {
+			if be.Op == influxql.OR {
+				invalidOP = true
+				return
+			}
+
+			if ref, ok := be.LHS.(*influxql.VarRef); ok {
+				if ref.Val == measurementRemap[measurementKey] {
+					if be.Op != influxql.EQ {
+						invalidOP = true
+						return
+					}
+
+					if lastMeasurement != "" {
+						foundOnce = false
+					}
+
+					// Check that RHS is a literal string
+					if ref, ok := be.RHS.(*influxql.StringLiteral); ok {
+						lastMeasurement = ref.Val
+					}
+				}
+			}
+		}
+	})
+	return lastMeasurement, len(lastMeasurement) > 0 && foundOnce && !invalidOP
+}
+
 func HasFieldKeyOrValue(expr influxql.Expr) (bool, bool) {
-	refs := hasRefs{refs: []string{"_field", "$"}, found: make([]bool, 2)}
+	refs := hasRefs{refs: []string{fieldKey, "$"}, found: make([]bool, 2)}
 	influxql.Walk(&refs, expr)
 	return refs.found[0], refs.found[1]
 }

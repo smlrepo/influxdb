@@ -16,29 +16,29 @@ type Cursor interface {
 	Err() error
 }
 
-type IntegerBatchCursor interface {
+type IntegerArrayCursor interface {
 	Cursor
-	Next() (keys []int64, values []int64)
+	Next() *IntegerArray
 }
 
-type FloatBatchCursor interface {
+type FloatArrayCursor interface {
 	Cursor
-	Next() (keys []int64, values []float64)
+	Next() *FloatArray
 }
 
-type UnsignedBatchCursor interface {
+type UnsignedArrayCursor interface {
 	Cursor
-	Next() (keys []int64, values []uint64)
+	Next() *UnsignedArray
 }
 
-type StringBatchCursor interface {
+type StringArrayCursor interface {
 	Cursor
-	Next() (keys []int64, values []string)
+	Next() *StringArray
 }
 
-type BooleanBatchCursor interface {
+type BooleanArrayCursor interface {
 	Cursor
-	Next() (keys []int64, values []bool)
+	Next() *BooleanArray
 }
 
 type CursorRequest struct {

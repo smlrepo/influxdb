@@ -174,7 +174,7 @@ func (p *SeriesPartition) Path() string { return p.path }
 func (p *SeriesPartition) IndexPath() string { return filepath.Join(p.path, "index") }
 
 // CreateSeriesListIfNotExists creates a list of series in bulk if they don't exist.
-// The returned ids list returns values for new series and zero for existing series.
+// The ids parameter is modified to contain series IDs for all keys belonging to this partition.
 func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitionIDs []int, ids []uint64) error {
 	var writeRequired bool
 	p.mu.RLock()
@@ -236,7 +236,6 @@ func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitio
 		if err != nil {
 			return err
 		}
-
 		// Append new key to be added to hash map after flush.
 		ids[i] = id
 		newIDs[string(key)] = id
@@ -282,6 +281,13 @@ func (p *SeriesPartition) CreateSeriesListIfNotExists(keys [][]byte, keyPartitio
 	return nil
 }
 
+// Compacting returns if the SeriesPartition is currently compacting.
+func (p *SeriesPartition) Compacting() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.compacting
+}
+
 // DeleteSeriesID flags a series as permanently deleted.
 // If the series is reintroduced later then it must create a new id.
 func (p *SeriesPartition) DeleteSeriesID(id uint64) error {
@@ -301,6 +307,13 @@ func (p *SeriesPartition) DeleteSeriesID(id uint64) error {
 	_, err := p.writeLogEntry(AppendSeriesEntry(nil, SeriesEntryTombstoneFlag, id, nil))
 	if err != nil {
 		return err
+	}
+
+	// Flush active segment write.
+	if segment := p.activeSegment(); segment != nil {
+		if err := segment.Flush(); err != nil {
+			return err
+		}
 	}
 
 	// Mark tombstone in memory.
@@ -382,7 +395,7 @@ func (p *SeriesPartition) EnableCompactions() {
 	if p.compactionsEnabled() {
 		return
 	}
-	p.compactionsDisabled++
+	p.compactionsDisabled--
 }
 
 func (p *SeriesPartition) compactionsEnabled() bool {
@@ -543,8 +556,9 @@ func (c *SeriesPartitionCompactor) compactIndexTo(index *SeriesIndex, seriesN ui
 		errDone := errors.New("done")
 
 		if err := segment.ForEachEntry(func(flag uint8, id uint64, offset int64, key []byte) error {
+
 			// Make sure we don't go past the offset where the compaction began.
-			if offset >= index.maxOffset {
+			if offset > index.maxOffset {
 				return errDone
 			}
 
@@ -566,13 +580,13 @@ func (c *SeriesPartitionCompactor) compactIndexTo(index *SeriesIndex, seriesN ui
 				return fmt.Errorf("unexpected series partition log entry flag: %d", flag)
 			}
 
+			// Save max series identifier processed.
+			hdr.MaxSeriesID, hdr.MaxOffset = id, offset
+
 			// Ignore entry if tombstoned.
 			if index.IsDeleted(id) {
 				return nil
 			}
-
-			// Save max series identifier processed.
-			hdr.MaxSeriesID, hdr.MaxOffset = id, offset
 
 			// Insert into maps.
 			c.insertIDOffsetMap(idOffsetMap, hdr.Capacity, id, offset)

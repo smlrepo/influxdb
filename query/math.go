@@ -1,15 +1,15 @@
 package query
 
 import (
+	"fmt"
 	"math"
-	"time"
 
 	"github.com/influxdata/influxql"
 )
 
 func isMathFunction(call *influxql.Call) bool {
 	switch call.Name {
-	case "sin", "cos", "tan":
+	case "abs", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "ln", "log2", "log10", "sqrt", "pow", "floor", "ceil", "round":
 		return true
 	}
 	return false
@@ -23,32 +23,187 @@ func (MathTypeMapper) MapType(measurement *influxql.Measurement, field string) i
 
 func (MathTypeMapper) CallType(name string, args []influxql.DataType) (influxql.DataType, error) {
 	switch name {
-	case "sin", "cos", "tan":
-		return influxql.Float, nil
+	case "sin", "cos", "tan", "atan", "exp", "log", "ln", "log2", "log10", "sqrt":
+		var arg0 influxql.DataType
+		if len(args) > 0 {
+			arg0 = args[0]
+		}
+		switch arg0 {
+		case influxql.Float, influxql.Integer, influxql.Unsigned, influxql.Unknown:
+			return influxql.Float, nil
+		default:
+			return influxql.Unknown, fmt.Errorf("invalid argument type for the first argument in %s(): %s", name, arg0)
+		}
+	case "asin", "acos":
+		var arg0 influxql.DataType
+		if len(args) > 0 {
+			arg0 = args[0]
+		}
+		switch arg0 {
+		case influxql.Float, influxql.Unknown:
+			return influxql.Float, nil
+		default:
+			return influxql.Unknown, fmt.Errorf("invalid argument type for the first argument in %s(): %s", name, arg0)
+		}
+	case "atan2", "pow":
+		var arg0, arg1 influxql.DataType
+		if len(args) > 0 {
+			arg0 = args[0]
+		}
+		if len(args) > 1 {
+			arg1 = args[1]
+		}
+
+		switch arg0 {
+		case influxql.Float, influxql.Integer, influxql.Unsigned, influxql.Unknown:
+			// Pass through to verify the second argument.
+		default:
+			return influxql.Unknown, fmt.Errorf("invalid argument type for the first argument in %s(): %s", name, arg0)
+		}
+
+		switch arg1 {
+		case influxql.Float, influxql.Integer, influxql.Unsigned, influxql.Unknown:
+			return influxql.Float, nil
+		default:
+			return influxql.Unknown, fmt.Errorf("invalid argument type for the second argument in %s(): %s", name, arg1)
+		}
+	case "abs", "floor", "ceil", "round":
+		var arg0 influxql.DataType
+		if len(args) > 0 {
+			arg0 = args[0]
+		}
+		switch arg0 {
+		case influxql.Float, influxql.Integer, influxql.Unsigned, influxql.Unknown:
+			return args[0], nil
+		default:
+			return influxql.Unknown, fmt.Errorf("invalid argument type for the first argument in %s(): %s", name, arg0)
+		}
 	}
 	return influxql.Unknown, nil
 }
 
-type MathValuer struct {
-	Valuer influxql.Valuer
-}
+type MathValuer struct{}
 
-func (v *MathValuer) Value(key string) (interface{}, bool) {
-	if v.Valuer != nil {
-		return v.Valuer.Value(key)
-	}
+var _ influxql.CallValuer = MathValuer{}
+
+func (MathValuer) Value(key string) (interface{}, bool) {
 	return nil, false
 }
 
-func (v *MathValuer) Call(name string, args []influxql.Expr) (interface{}, bool) {
+func (v MathValuer) Call(name string, args []interface{}) (interface{}, bool) {
 	if len(args) == 1 {
+		arg0 := args[0]
 		switch name {
+		case "abs":
+			switch arg0 := arg0.(type) {
+			case float64:
+				return math.Abs(arg0), true
+			case int64, uint64:
+				return arg0, true
+			default:
+				return nil, true
+			}
 		case "sin":
-			return v.callTrigFunction(math.Sin, args[0])
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Sin(arg0), true
+			}
+			return nil, true
 		case "cos":
-			return v.callTrigFunction(math.Cos, args[0])
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Cos(arg0), true
+			}
+			return nil, true
 		case "tan":
-			return v.callTrigFunction(math.Tan, args[0])
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Tan(arg0), true
+			}
+			return nil, true
+		case "floor":
+			switch arg0 := arg0.(type) {
+			case float64:
+				return math.Floor(arg0), true
+			case int64, uint64:
+				return arg0, true
+			default:
+				return nil, true
+			}
+		case "ceil":
+			switch arg0 := arg0.(type) {
+			case float64:
+				return math.Ceil(arg0), true
+			case int64, uint64:
+				return arg0, true
+			default:
+				return nil, true
+			}
+		case "round":
+			switch arg0 := arg0.(type) {
+			case float64:
+				return round(arg0), true
+			case int64, uint64:
+				return arg0, true
+			default:
+				return nil, true
+			}
+		case "asin":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Asin(arg0), true
+			}
+			return nil, true
+		case "acos":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Acos(arg0), true
+			}
+			return nil, true
+		case "atan":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Atan(arg0), true
+			}
+			return nil, true
+		case "exp":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Exp(arg0), true
+			}
+			return nil, true
+		case "ln":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Log(arg0), true
+			}
+			return nil, true
+		case "log2":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Log2(arg0), true
+			}
+			return nil, true
+		case "log10":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Log10(arg0), true
+			}
+			return nil, true
+		case "sqrt":
+			if arg0, ok := asFloat(arg0); ok {
+				return math.Sqrt(arg0), true
+			}
+			return nil, true
+		}
+	} else if len(args) == 2 {
+		arg0, arg1 := args[0], args[1]
+		switch name {
+		case "atan2":
+			if arg0, arg1, ok := asFloats(arg0, arg1); ok {
+				return math.Atan2(arg0, arg1), true
+			}
+			return nil, true
+		case "log":
+			if arg0, arg1, ok := asFloats(arg0, arg1); ok {
+				return math.Log(arg0) / math.Log(arg1), true
+			}
+			return nil, true
+		case "pow":
+			if arg0, arg1, ok := asFloats(arg0, arg1); ok {
+				return math.Pow(arg0, arg1), true
+			}
+			return nil, true
 		}
 	}
 	if v, ok := v.Valuer.(influxql.CallValuer); ok {
@@ -61,35 +216,35 @@ func (v *MathValuer) Call(name string, args []influxql.Expr) (interface{}, bool)
 	return nil, false
 }
 
-func (v *MathValuer) callTrigFunction(fn func(x float64) float64, arg0 influxql.Expr) (interface{}, bool) {
-	var value float64
-	switch arg0 := arg0.(type) {
-	case *influxql.NumberLiteral:
-		value = arg0.Val
-	case *influxql.IntegerLiteral:
-		value = float64(arg0.Val)
-	case *influxql.VarRef:
-		if v.Valuer == nil {
-			return nil, false
-		} else if val, ok := v.Valuer.Value(arg0.Val); ok {
-			switch val := val.(type) {
-			case float64:
-				value = val
-			case int64:
-				value = float64(val)
-			}
-		} else {
-			return nil, false
-		}
+func asFloat(x interface{}) (float64, bool) {
+	switch arg0 := x.(type) {
+	case float64:
+		return arg0, true
+	case int64:
+		return float64(arg0), true
+	case uint64:
+		return float64(arg0), true
 	default:
-		return nil, false
+		return 0, false
 	}
-	return fn(value), true
 }
 
-func (v *MathValuer) Zone() *time.Location {
-	if v, ok := v.Valuer.(influxql.ZoneValuer); ok {
-		return v.Zone()
+func asFloats(x, y interface{}) (float64, float64, bool) {
+	arg0, ok := asFloat(x)
+	if !ok {
+		return 0, 0, false
 	}
-	return nil
+	arg1, ok := asFloat(y)
+	if !ok {
+		return 0, 0, false
+	}
+	return arg0, arg1, true
+}
+
+func round(x float64) float64 {
+	t := math.Trunc(x)
+	if math.Abs(x-t) >= 0.5 {
+		return t + math.Copysign(1, x)
+	}
+	return t
 }

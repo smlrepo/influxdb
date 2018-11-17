@@ -7,26 +7,43 @@ import (
 	"github.com/influxdata/influxdb/tsdb"
 )
 
-type readRequest struct {
-	ctx        context.Context
-	start, end int64
-	asc        bool
-	limit      uint64
-	aggregate  *Aggregate
+type multiShardCursors interface {
+	createCursor(row SeriesRow) tsdb.Cursor
+	newAggregateCursor(ctx context.Context, agg *Aggregate, cursor tsdb.Cursor) tsdb.Cursor
 }
 
-type ResultSet struct {
-	req readRequest
-	cur seriesCursor
-	row seriesRow
+type resultSet struct {
+	ctx context.Context
+	agg *Aggregate
+	cur SeriesCursor
+	row SeriesRow
+	mb  multiShardCursors
 }
 
-func (r *ResultSet) Close() {
-	r.row.query = nil
+func NewResultSet(ctx context.Context, req *ReadRequest, cur SeriesCursor) ResultSet {
+	return &resultSet{
+		ctx: ctx,
+		agg: req.Aggregate,
+		cur: cur,
+		mb:  newMultiShardArrayCursors(ctx, req.TimestampRange.Start, req.TimestampRange.End, !req.Descending, req.PointsLimit),
+	}
+}
+
+// Close closes the result set. Close is idempotent.
+func (r *resultSet) Close() {
+	if r == nil {
+		return // Nothing to do.
+	}
+	r.row.Query = nil
 	r.cur.Close()
 }
 
-func (r *ResultSet) Next() bool {
+// Next returns true if there are more results available.
+func (r *resultSet) Next() bool {
+	if r == nil {
+		return false
+	}
+
 	row := r.cur.Next()
 	if row == nil {
 		return false
@@ -37,14 +54,14 @@ func (r *ResultSet) Next() bool {
 	return true
 }
 
-func (r *ResultSet) Cursor() tsdb.Cursor {
-	cur := newMultiShardBatchCursor(r.req.ctx, r.row, &r.req)
-	if r.req.aggregate != nil {
-		cur = newAggregateBatchCursor(r.req.ctx, r.req.aggregate, cur)
+func (r *resultSet) Cursor() tsdb.Cursor {
+	cur := r.mb.createCursor(r.row)
+	if r.agg != nil {
+		cur = r.mb.newAggregateCursor(r.ctx, r.agg, cur)
 	}
 	return cur
 }
 
-func (r *ResultSet) Tags() models.Tags {
-	return r.row.tags
+func (r *resultSet) Tags() models.Tags {
+	return r.row.Tags
 }

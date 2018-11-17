@@ -90,7 +90,7 @@ func (c *CommandLine) Run() error {
 
 	// Check if we will be able to prompt for the password later.
 	if promptForPassword && !hasTTY {
-		return errors.New("Unable to prompt for a password with no TTY.")
+		return errors.New("unable to prompt for a password with no TTY")
 	}
 
 	// Read environment variables for username/password.
@@ -166,7 +166,7 @@ func (c *CommandLine) Run() error {
 
 		i := v8.NewImporter(config)
 		if err := i.Import(); err != nil {
-			err = fmt.Errorf("ERROR: %s\n", err)
+			err = fmt.Errorf("ERROR: %s", err)
 			return err
 		}
 		return nil
@@ -706,7 +706,7 @@ func (c *CommandLine) parseInto(stmt string) *client.BatchPoints {
 func (c *CommandLine) parseInsert(stmt string) (*client.BatchPoints, error) {
 	i, point := parseNextIdentifier(stmt)
 	if !strings.EqualFold(i, "insert") {
-		return nil, fmt.Errorf("found %s, expected INSERT\n", i)
+		return nil, fmt.Errorf("found %s, expected INSERT", i)
 	}
 	if i, r := parseNextIdentifier(point); strings.EqualFold(i, "into") {
 		bp := c.parseInto(r)
@@ -744,11 +744,12 @@ func (c *CommandLine) Insert(stmt string) error {
 // query creates a query struct to be used with the client.
 func (c *CommandLine) query(query string) client.Query {
 	return client.Query{
-		Command:   query,
-		Database:  c.Database,
-		Chunked:   c.Chunked,
-		ChunkSize: c.ChunkSize,
-		NodeID:    c.NodeID,
+		Command:         query,
+		Database:        c.Database,
+		RetentionPolicy: c.RetentionPolicy,
+		Chunked:         c.Chunked,
+		ChunkSize:       c.ChunkSize,
+		NodeID:          c.NodeID,
 	}
 }
 
@@ -800,6 +801,8 @@ func (c *CommandLine) ExecuteQuery(query string) error {
 			err = ctx.Err()
 			if err == context.Canceled {
 				err = errors.New("aborted by user")
+			} else if err == nil {
+				err = errors.New("no data received")
 			}
 		}
 		fmt.Printf("ERR: %s\n", err)

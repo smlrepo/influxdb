@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"unsafe"
 
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/pkg/estimator"
@@ -56,15 +57,15 @@ type IndexFile struct {
 	seriesIDSetData          []byte
 	tombstoneSeriesIDSetData []byte
 
-	// Series sketches
-	sketch, tSketch estimator.Sketch
+	// Series sketch data.
+	sketchData, tSketchData []byte
 
 	// Sortable identifier & filepath to the log file.
 	level int
 	id    int
 
+	mu sync.RWMutex
 	// Compaction tracking.
-	mu         sync.RWMutex
 	compacting bool
 
 	// Path to data file.
@@ -74,10 +75,34 @@ type IndexFile struct {
 // NewIndexFile returns a new instance of IndexFile.
 func NewIndexFile(sfile *tsdb.SeriesFile) *IndexFile {
 	return &IndexFile{
-		sfile:   sfile,
-		sketch:  hll.NewDefaultPlus(),
-		tSketch: hll.NewDefaultPlus(),
+		sfile: sfile,
 	}
+}
+
+// bytes estimates the memory footprint of this IndexFile, in bytes.
+func (f *IndexFile) bytes() int {
+	var b int
+	f.wg.Add(1)
+	b += 16 // wg WaitGroup is 16 bytes
+	b += int(unsafe.Sizeof(f.data))
+	// Do not count f.data contents because it is mmap'd
+	b += int(unsafe.Sizeof(f.sfile))
+	// Do not count SeriesFile because it belongs to the code that constructed this IndexFile.
+	b += int(unsafe.Sizeof(f.tblks))
+	for k, v := range f.tblks {
+		// Do not count TagBlock contents, they all reference f.data
+		b += int(unsafe.Sizeof(k)) + len(k)
+		b += int(unsafe.Sizeof(*v))
+	}
+	b += int(unsafe.Sizeof(f.mblk)) + f.mblk.bytes()
+	b += int(unsafe.Sizeof(f.seriesIDSetData) + unsafe.Sizeof(f.tombstoneSeriesIDSetData))
+	// Do not count contents of seriesIDSetData or tombstoneSeriesIDSetData: references f.data
+	b += int(unsafe.Sizeof(f.level) + unsafe.Sizeof(f.id))
+	b += 24 // mu RWMutex is 24 bytes
+	b += int(unsafe.Sizeof(f.compacting))
+	b += int(unsafe.Sizeof(f.path)) + len(f.path)
+	f.wg.Done()
+	return b
 }
 
 // Open memory maps the data file at the file's path.
@@ -157,26 +182,15 @@ func (f *IndexFile) UnmarshalBinary(data []byte) error {
 	}
 
 	// Slice series sketch data.
-	buf := data[t.SeriesSketch.Offset : t.SeriesSketch.Offset+t.SeriesSketch.Size]
-	if err := f.sketch.UnmarshalBinary(buf); err != nil {
-		return err
-	}
-
-	buf = data[t.TombstoneSeriesSketch.Offset : t.TombstoneSeriesSketch.Offset+t.TombstoneSeriesSketch.Size]
-	if err := f.tSketch.UnmarshalBinary(buf); err != nil {
-		return err
-	}
+	f.sketchData = data[t.SeriesSketch.Offset : t.SeriesSketch.Offset+t.SeriesSketch.Size]
+	f.tSketchData = data[t.TombstoneSeriesSketch.Offset : t.TombstoneSeriesSketch.Offset+t.TombstoneSeriesSketch.Size]
 
 	// Slice series set data.
 	f.seriesIDSetData = data[t.SeriesIDSet.Offset : t.SeriesIDSet.Offset+t.SeriesIDSet.Size]
 	f.tombstoneSeriesIDSetData = data[t.TombstoneSeriesIDSet.Offset : t.TombstoneSeriesIDSet.Offset+t.TombstoneSeriesIDSet.Size]
 
-	// Slice measurement block data.
-	buf = data[t.MeasurementBlock.Offset:]
-	buf = buf[:t.MeasurementBlock.Size]
-
 	// Unmarshal measurement block.
-	if err := f.mblk.UnmarshalBinary(buf); err != nil {
+	if err := f.mblk.UnmarshalBinary(data[t.MeasurementBlock.Offset:][:t.MeasurementBlock.Size]); err != nil {
 		return err
 	}
 
@@ -215,7 +229,7 @@ func (f *IndexFile) SeriesIDSet() (*tsdb.SeriesIDSet, error) {
 
 func (f *IndexFile) TombstoneSeriesIDSet() (*tsdb.SeriesIDSet, error) {
 	ss := tsdb.NewSeriesIDSet()
-	if err := ss.UnmarshalBinary(f.tombstoneSeriesIDSetData); err != nil {
+	if err := ss.UnmarshalBinaryUnsafe(f.tombstoneSeriesIDSetData); err != nil {
 		return nil, err
 	}
 	return ss, nil
@@ -300,22 +314,21 @@ func (f *IndexFile) TagKeySeriesIDIterator(name, key []byte) tsdb.SeriesIDIterat
 	return tsdb.MergeSeriesIDIterators(itrs...)
 }
 
-// TagValueSeriesIDIterator returns a series iterator for a tag value and a flag
-// indicating if a tombstone exists on the measurement, key, or value.
-func (f *IndexFile) TagValueSeriesIDIterator(name, key, value []byte) tsdb.SeriesIDIterator {
+// TagValueSeriesIDSet returns a series id set for a tag value.
+func (f *IndexFile) TagValueSeriesIDSet(name, key, value []byte) (*tsdb.SeriesIDSet, error) {
 	tblk := f.tblks[string(name)]
 	if tblk == nil {
-		return nil
+		return nil, nil
 	}
 
 	// Find value element.
-	n, data := tblk.TagValueSeriesData(key, value)
-	if n == 0 {
-		return nil
+	var valueElem TagBlockValueElem
+	if !tblk.DecodeTagValueElem(key, value, &valueElem) {
+		return nil, nil
+	} else if valueElem.SeriesN() == 0 {
+		return nil, nil
 	}
-
-	// Create an iterator over value's series.
-	return &rawSeriesIDIterator{n: n, data: data}
+	return valueElem.SeriesIDSet()
 }
 
 // TagKey returns a tag key.
@@ -369,22 +382,23 @@ func (f *IndexFile) MeasurementSeriesIDIterator(name []byte) tsdb.SeriesIDIterat
 	return f.mblk.SeriesIDIterator(name)
 }
 
-// MergeMeasurementsSketches merges the index file's measurements sketches into
-// the provided sketches.
-func (f *IndexFile) MergeMeasurementsSketches(s, t estimator.Sketch) error {
-	if err := s.Merge(f.mblk.sketch); err != nil {
-		return err
-	}
-	return t.Merge(f.mblk.tSketch)
+// MeasurementsSketches returns existence and tombstone sketches for measurements.
+func (f *IndexFile) MeasurementsSketches() (sketch, tSketch estimator.Sketch, err error) {
+	return f.mblk.Sketches()
 }
 
-// MergeSeriesSketches merges the index file's series sketches into the provided
-// sketches.
-func (f *IndexFile) MergeSeriesSketches(s, t estimator.Sketch) error {
-	if err := s.Merge(f.sketch); err != nil {
-		return err
+// SeriesSketches returns existence and tombstone sketches for series.
+func (f *IndexFile) SeriesSketches() (sketch, tSketch estimator.Sketch, err error) {
+	sketch = hll.NewDefaultPlus()
+	if err := sketch.UnmarshalBinary(f.sketchData); err != nil {
+		return nil, nil, err
 	}
-	return t.Merge(f.tSketch)
+
+	tSketch = hll.NewDefaultPlus()
+	if err := tSketch.UnmarshalBinary(f.tSketchData); err != nil {
+		return nil, nil, err
+	}
+	return sketch, tSketch, nil
 }
 
 // ReadIndexFileTrailer returns the index file trailer from data.

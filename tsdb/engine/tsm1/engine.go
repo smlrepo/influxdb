@@ -24,8 +24,10 @@ import (
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/pkg/bytesutil"
 	"github.com/influxdata/influxdb/pkg/estimator"
+	"github.com/influxdata/influxdb/pkg/file"
 	"github.com/influxdata/influxdb/pkg/limiter"
 	"github.com/influxdata/influxdb/pkg/metrics"
+	"github.com/influxdata/influxdb/pkg/radix"
 	intar "github.com/influxdata/influxdb/pkg/tar"
 	"github.com/influxdata/influxdb/pkg/tracing"
 	"github.com/influxdata/influxdb/query"
@@ -37,10 +39,12 @@ import (
 	"go.uber.org/zap"
 )
 
-//go:generate tmpl -data=@iterator.gen.go.tmpldata iterator.gen.go.tmpl batch_cursor.gen.go.tmpl cursor_iterator.gen.go.tmpl
-//go:generate tmpl -data=@file_store.gen.go.tmpldata file_store.gen.go.tmpl
+//go:generate tmpl -data=@iterator.gen.go.tmpldata iterator.gen.go.tmpl engine.gen.go.tmpl array_cursor.gen.go.tmpl array_cursor_iterator.gen.go.tmpl
+//go:generate go run ../../../_tools/tmpl/main.go -i -data=file_store.gen.go.tmpldata file_store.gen.go.tmpl=file_store.gen.go
+//go:generate go run ../../../_tools/tmpl/main.go -i -d isArray=y -data=file_store.gen.go.tmpldata file_store.gen.go.tmpl=file_store_array.gen.go
 //go:generate tmpl -data=@encoding.gen.go.tmpldata encoding.gen.go.tmpl
 //go:generate tmpl -data=@compact.gen.go.tmpldata compact.gen.go.tmpl
+//go:generate tmpl -data=@reader.gen.go.tmpldata reader.gen.go.tmpl
 
 func init() {
 	tsdb.RegisterEngine("tsm1", NewEngine)
@@ -145,7 +149,6 @@ type Engine struct {
 	snapWG   *sync.WaitGroup // waitgroup for running snapshot compactions
 
 	id           uint64
-	database     string
 	path         string
 	sfile        *tsdb.SeriesFile
 	logger       *zap.Logger // Logger to be used for important messages
@@ -162,7 +165,7 @@ type Engine struct {
 
 	MaxPointsPerBlock int
 
-	// CacheFlushMemorySizeThreshold specifies the minimum size threshodl for
+	// CacheFlushMemorySizeThreshold specifies the minimum size threshold for
 	// the cache when the engine should write a snapshot to a TSM file
 	CacheFlushMemorySizeThreshold uint64
 
@@ -174,6 +177,9 @@ type Engine struct {
 	// WALEnabled determines whether writes to the WAL are enabled.  If this is false,
 	// writes will only exist in the cache and can be lost if a snapshot has not occurred.
 	WALEnabled bool
+
+	// Invoked when creating a backup file "as new".
+	formatFileName FormatFileNameFunc
 
 	// Controls whether to enabled compactions when the engine is open
 	enableCompactionsOnOpen bool
@@ -187,21 +193,32 @@ type Engine struct {
 
 	// provides access to the total set of series IDs
 	seriesIDSets tsdb.SeriesIDSets
+
+	// seriesTypeMap maps a series key to field type
+	seriesTypeMap *radix.Tree
 }
 
 // NewEngine returns a new instance of Engine.
-func NewEngine(id uint64, idx tsdb.Index, database, path string, walPath string, sfile *tsdb.SeriesFile, opt tsdb.EngineOptions) tsdb.Engine {
-	w := NewWAL(walPath)
-	w.syncDelay = time.Duration(opt.Config.WALFsyncDelay)
+func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *tsdb.SeriesFile, opt tsdb.EngineOptions) tsdb.Engine {
+	var wal *WAL
+	if opt.WALEnabled {
+		wal = NewWAL(walPath)
+		wal.syncDelay = time.Duration(opt.Config.WALFsyncDelay)
+	}
 
 	fs := NewFileStore(path)
-	cache := NewCache(uint64(opt.Config.CacheMaxMemorySize), path)
-
-	c := &Compactor{
-		Dir:       path,
-		FileStore: fs,
-		RateLimit: opt.CompactionThroughputLimiter,
+	fs.openLimiter = opt.OpenLimiter
+	if opt.FileStoreObserver != nil {
+		fs.WithObserver(opt.FileStoreObserver)
 	}
+	fs.tsmMMAPWillNeed = opt.Config.TSMWillNeed
+
+	cache := NewCache(uint64(opt.Config.CacheMaxMemorySize))
+
+	c := NewCompactor()
+	c.Dir = path
+	c.FileStore = fs
+	c.RateLimit = opt.CompactionThroughputLimiter
 
 	var planner CompactionPlanner = NewDefaultPlanner(fs, time.Duration(opt.Config.CompactFullWriteColdDuration))
 	if opt.CompactionPlannerCreator != nil {
@@ -213,7 +230,6 @@ func NewEngine(id uint64, idx tsdb.Index, database, path string, walPath string,
 	stats := &EngineStatistics{}
 	e := &Engine{
 		id:           id,
-		database:     database,
 		path:         path,
 		index:        idx,
 		sfile:        sfile,
@@ -221,7 +237,7 @@ func NewEngine(id uint64, idx tsdb.Index, database, path string, walPath string,
 		traceLogger:  logger,
 		traceLogging: opt.Config.TraceLoggingEnabled,
 
-		WAL:   w,
+		WAL:   wal,
 		Cache: cache,
 
 		FileStore:      fs,
@@ -232,81 +248,120 @@ func NewEngine(id uint64, idx tsdb.Index, database, path string, walPath string,
 		CacheFlushWriteColdDuration:   time.Duration(opt.Config.CacheSnapshotWriteColdDuration),
 		enableCompactionsOnOpen:       true,
 		WALEnabled:                    opt.WALEnabled,
+		formatFileName:                DefaultFormatFileName,
 		stats:                         stats,
 		compactionLimiter:             opt.CompactionLimiter,
 		scheduler:                     newScheduler(stats, opt.CompactionLimiter.Capacity()),
 		seriesIDSets:                  opt.SeriesIDSets,
 	}
 
+	// Feature flag to enable per-series type checking, by default this is off and
+	// e.seriesTypeMap will be nil.
+	if os.Getenv("INFLUXDB_SERIES_TYPE_CHECK_ENABLED") != "" {
+		e.seriesTypeMap = radix.New()
+	}
+
 	if e.traceLogging {
 		fs.enableTraceLogging(true)
-		w.enableTraceLogging(true)
+		if e.WALEnabled {
+			e.WAL.enableTraceLogging(true)
+		}
 	}
 
 	return e
 }
 
+func (e *Engine) WithFormatFileNameFunc(formatFileNameFunc FormatFileNameFunc) {
+	e.Compactor.WithFormatFileNameFunc(formatFileNameFunc)
+	e.formatFileName = formatFileNameFunc
+}
+
+func (e *Engine) WithParseFileNameFunc(parseFileNameFunc ParseFileNameFunc) {
+	e.FileStore.WithParseFileNameFunc(parseFileNameFunc)
+	e.Compactor.WithParseFileNameFunc(parseFileNameFunc)
+}
+
 // Digest returns a reader for the shard's digest.
 func (e *Engine) Digest() (io.ReadCloser, int64, error) {
-	digestPath := filepath.Join(e.path, "digest.tsd")
+	log, logEnd := logger.NewOperation(e.logger, "Engine digest", "tsm1_digest")
+	defer logEnd()
 
-	// See if there's an existing digest file on disk.
-	f, err := os.Open(digestPath)
-	if err == nil {
-		// There is an existing digest file. Now see if it is still fresh.
-		fi, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return nil, 0, err
-		}
+	log.Info("Starting digest", zap.String("tsm1_path", e.path))
 
-		if !e.LastModified().After(fi.ModTime()) {
-			// Existing digest is still fresh so return a reader for it.
+	digestPath := filepath.Join(e.path, DigestFilename)
+
+	// Get a list of tsm file paths from the FileStore.
+	files := e.FileStore.Files()
+	tsmfiles := make([]string, 0, len(files))
+	for _, f := range files {
+		tsmfiles = append(tsmfiles, f.Path())
+	}
+
+	// See if there's a fresh digest cached on disk.
+	fresh, reason := DigestFresh(e.path, tsmfiles, e.LastModified())
+	if fresh {
+		f, err := os.Open(digestPath)
+		if err == nil {
 			fi, err := f.Stat()
 			if err != nil {
-				f.Close()
+				log.Info("Digest aborted, couldn't stat digest file", logger.Shard(e.id), zap.Error(err))
 				return nil, 0, err
 			}
+
+			log.Info("Digest is fresh", logger.Shard(e.id), zap.String("path", digestPath))
+
+			// Return the cached digest.
 			return f, fi.Size(), nil
 		}
-
-		if err := f.Close(); err != nil {
-			return nil, 0, err
-		}
 	}
+
+	log.Info("Digest stale", logger.Shard(e.id), zap.String("reason", reason))
 
 	// Either no digest existed or the existing one was stale
 	// so generate a new digest.
 
+	// Make sure the directory exists, in case it was deleted for some reason.
+	if err := os.MkdirAll(e.path, 0777); err != nil {
+		log.Info("Digest aborted, problem creating shard directory path", zap.Error(err))
+		return nil, 0, err
+	}
+
 	// Create a tmp file to write the digest to.
 	tf, err := os.Create(digestPath + ".tmp")
 	if err != nil {
+		log.Info("Digest aborted, problem creating tmp digest", zap.Error(err))
 		return nil, 0, err
 	}
 
 	// Write the new digest to the tmp file.
-	if err := Digest(e.path, tf); err != nil {
+	if err := Digest(e.path, tsmfiles, tf); err != nil {
+		log.Info("Digest aborted, problem writing tmp digest", zap.Error(err))
 		tf.Close()
 		os.Remove(tf.Name())
 		return nil, 0, err
 	}
 
 	// Rename the temporary digest file to the actual digest file.
-	if err := renameFile(tf.Name(), digestPath); err != nil {
+	if err := file.RenameFile(tf.Name(), digestPath); err != nil {
+		log.Info("Digest aborted, problem renaming tmp digest", zap.Error(err))
 		return nil, 0, err
 	}
 
 	// Create and return a reader for the new digest file.
-	f, err = os.Open(digestPath)
+	f, err := os.Open(digestPath)
 	if err != nil {
+		log.Info("Digest aborted, opening new digest", zap.Error(err))
 		return nil, 0, err
 	}
 
 	fi, err := f.Stat()
 	if err != nil {
+		log.Info("Digest aborted, can't stat new digest", zap.Error(err))
 		f.Close()
 		return nil, 0, err
 	}
+
+	log.Info("Digest written", zap.String("tsm1_digest_path", digestPath), zap.Int64("size", fi.Size()))
 
 	return f, fi.Size(), nil
 }
@@ -559,11 +614,10 @@ func (e *Engine) SeriesSketches() (estimator.Sketch, estimator.Sketch, error) {
 
 // LastModified returns the time when this shard was last modified.
 func (e *Engine) LastModified() time.Time {
-	walTime := e.WAL.LastWriteTime()
 	fsTime := e.FileStore.LastModified()
 
-	if walTime.After(fsTime) {
-		return walTime
+	if e.WALEnabled && e.WAL.LastWriteTime().After(fsTime) {
+		return e.WAL.LastWriteTime()
 	}
 
 	return fsTime
@@ -641,13 +695,19 @@ func (e *Engine) Statistics(tags map[string]string) []models.Statistic {
 
 	statistics = append(statistics, e.Cache.Statistics(tags)...)
 	statistics = append(statistics, e.FileStore.Statistics(tags)...)
-	statistics = append(statistics, e.WAL.Statistics(tags)...)
+	if e.WALEnabled {
+		statistics = append(statistics, e.WAL.Statistics(tags)...)
+	}
 	return statistics
 }
 
 // DiskSize returns the total size in bytes of all TSM and WAL segments on disk.
 func (e *Engine) DiskSize() int64 {
-	return e.FileStore.DiskSizeBytes() + e.WAL.DiskSizeBytes()
+	var walDiskSizeBytes int64
+	if e.WALEnabled {
+		walDiskSizeBytes = e.WAL.DiskSizeBytes()
+	}
+	return e.FileStore.DiskSizeBytes() + walDiskSizeBytes
 }
 
 // Open opens and initializes the engine.
@@ -671,16 +731,20 @@ func (e *Engine) Open() error {
 
 	e.index.SetFieldSet(fields)
 
-	if err := e.WAL.Open(); err != nil {
-		return err
+	if e.WALEnabled {
+		if err := e.WAL.Open(); err != nil {
+			return err
+		}
 	}
 
 	if err := e.FileStore.Open(); err != nil {
 		return err
 	}
 
-	if err := e.reloadCache(); err != nil {
-		return err
+	if e.WALEnabled {
+		if err := e.reloadCache(); err != nil {
+			return err
+		}
 	}
 
 	e.Compactor.Open()
@@ -704,7 +768,10 @@ func (e *Engine) Close() error {
 	if err := e.FileStore.Close(); err != nil {
 		return err
 	}
-	return e.WAL.Close()
+	if e.WALEnabled {
+		return e.WAL.Close()
+	}
+	return nil
 }
 
 // WithLogger sets the logger for the engine.
@@ -715,7 +782,9 @@ func (e *Engine) WithLogger(log *zap.Logger) {
 		e.traceLogger = e.logger
 	}
 
-	e.WAL.WithLogger(e.logger)
+	if e.WALEnabled {
+		e.WAL.WithLogger(e.logger)
+	}
 	e.FileStore.WithLogger(e.logger)
 }
 
@@ -960,7 +1029,12 @@ func (e *Engine) filterFileToBackup(r *TSMReader, fi os.FileInfo, shardRelativeP
 		return err
 	}
 
-	return intar.StreamFile(fi, shardRelativePath, path, tw)
+	tmpFi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	return intar.StreamRenameFile(tmpFi, fi.Name(), shardRelativePath, path, tw)
 }
 
 // Restore reads a tar archive generated by Backup().
@@ -1003,7 +1077,7 @@ func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 			}
 		}
 
-		if err := syncDir(e.path); err != nil {
+		if err := file.SyncDir(e.path); err != nil {
 			return nil, err
 		}
 
@@ -1019,7 +1093,13 @@ func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 	}
 
 	// Load any new series keys to the index
-	readers := make([]chan seriesKey, 0, len(newFiles))
+	tsmFiles := make([]TSMFile, 0, len(newFiles))
+	defer func() {
+		for _, r := range tsmFiles {
+			r.Close()
+		}
+	}()
+
 	ext := fmt.Sprintf(".%s", TmpTSMFileExtension)
 	for _, f := range newFiles {
 		// If asNew is true, the files created from readFileFromBackup will be new ones
@@ -1030,9 +1110,6 @@ func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 			continue
 		}
 
-		ch := make(chan seriesKey, 1)
-		readers = append(readers, ch)
-
 		fd, err := os.Open(f)
 		if err != nil {
 			return err
@@ -1042,30 +1119,23 @@ func (e *Engine) overlay(r io.Reader, basePath string, asNew bool) error {
 		if err != nil {
 			return err
 		}
-		defer r.Close()
-
-		go func(c chan seriesKey, r *TSMReader) {
-			n := r.KeyCount()
-			for i := 0; i < n; i++ {
-				key, typ := r.KeyAt(i)
-				c <- seriesKey{key, typ}
-			}
-			close(c)
-		}(ch, r)
+		tsmFiles = append(tsmFiles, r)
 	}
 
 	// Merge and dedup all the series keys across each reader to reduce
 	// lock contention on the index.
 	keys := make([][]byte, 0, 10000)
 	fieldTypes := make([]influxql.DataType, 0, 10000)
-	merged := merge(readers...)
-	for v := range merged {
-		fieldType := BlockTypeToInfluxQLDataType(v.typ)
+
+	ki := newMergeKeyIterator(tsmFiles, nil)
+	for ki.Next() {
+		key, typ := ki.Read()
+		fieldType := BlockTypeToInfluxQLDataType(typ)
 		if fieldType == influxql.Unknown {
-			return fmt.Errorf("unknown block type: %v", v.typ)
+			return fmt.Errorf("unknown block type: %v", typ)
 		}
 
-		keys = append(keys, v.key)
+		keys = append(keys, key)
 		fieldTypes = append(fieldTypes, fieldType)
 
 		if len(keys) == cap(keys) {
@@ -1123,7 +1193,7 @@ func (e *Engine) readFileFromBackup(tr *tar.Reader, shardRelativePath string, as
 	}
 
 	if asNew {
-		filename = fmt.Sprintf("%09d-%09d.%s", e.FileStore.NextGeneration(), 1, TSMFileExtension)
+		filename = e.formatFileName(e.FileStore.NextGeneration(), 1) + "." + TSMFileExtension
 	}
 
 	tmp := fmt.Sprintf("%s.%s", filepath.Join(e.path, filename), TmpTSMFileExtension)
@@ -1158,7 +1228,7 @@ func (e *Engine) addToIndexFromKey(keys [][]byte, fieldTypes []influxql.DataType
 	for i := 0; i < len(keys); i++ {
 		// Replace tsm key format with index key format.
 		keys[i], field = SeriesAndFieldFromCompositeKey(keys[i])
-		name := tsdb.MeasurementFromSeriesKey(keys[i])
+		name := models.ParseName(keys[i])
 		mf := e.fieldset.CreateFieldsIfNotExists(name)
 		if err := mf.CreateFieldIfNotExists(field, fieldTypes[i]); err != nil {
 			return err
@@ -1186,8 +1256,12 @@ func (e *Engine) addToIndexFromKey(keys [][]byte, fieldTypes []influxql.DataType
 // It returns an error if new points are added to an existing key.
 func (e *Engine) WritePoints(points []models.Point) error {
 	values := make(map[string][]Value, len(points))
-	var keyBuf []byte
-	var baseLen int
+	var (
+		keyBuf    []byte
+		baseLen   int
+		seriesErr error
+	)
+
 	for _, p := range points {
 		keyBuf = append(keyBuf[:0], p.Key()...)
 		keyBuf = append(keyBuf, keyFieldSeparator...)
@@ -1201,6 +1275,37 @@ func (e *Engine) WritePoints(points []models.Point) error {
 			}
 
 			keyBuf = append(keyBuf[:baseLen], iter.FieldKey()...)
+
+			if e.seriesTypeMap != nil {
+				// Fast-path check to see if the field for the series already exists.
+				if v, ok := e.seriesTypeMap.Get(keyBuf); !ok {
+					if typ, err := e.Type(keyBuf); err != nil {
+						// Field type is unknown, we can try to add it.
+					} else if typ != iter.Type() {
+						// Existing type is different from what was passed in, we need to drop
+						// this write and refresh the series type map.
+						seriesErr = tsdb.ErrFieldTypeConflict
+						e.seriesTypeMap.Insert(keyBuf, int(typ))
+						continue
+					}
+
+					// Doesn't exsts, so try to insert
+					vv, ok := e.seriesTypeMap.Insert(keyBuf, int(iter.Type()))
+
+					// We didn't insert and the type that exists isn't what we tried to insert, so
+					// we have a conflict and must drop this field/series.
+					if !ok || vv != int(iter.Type()) {
+						seriesErr = tsdb.ErrFieldTypeConflict
+						continue
+					}
+				} else if v != int(iter.Type()) {
+					// The series already exists, but with a different type.  This is also a type conflict
+					// and we need to drop this field/series.
+					seriesErr = tsdb.ErrFieldTypeConflict
+					continue
+				}
+			}
+
 			var v Value
 			switch iter.Type() {
 			case models.Float:
@@ -1240,25 +1345,28 @@ func (e *Engine) WritePoints(points []models.Point) error {
 	defer e.mu.RUnlock()
 
 	// first try to write to the cache
-	err := e.Cache.WriteMulti(values)
-	if err != nil {
+	if err := e.Cache.WriteMulti(values); err != nil {
 		return err
 	}
 
 	if e.WALEnabled {
-		_, err = e.WAL.WriteMulti(values)
+		if _, err := e.WAL.WriteMulti(values); err != nil {
+			return err
+		}
 	}
-	return err
+	return seriesErr
 }
 
 // DeleteSeriesRange removes the values between min and max (inclusive) from all series
 func (e *Engine) DeleteSeriesRange(itr tsdb.SeriesIterator, min, max int64) error {
-	return e.DeleteSeriesRangeWithPredicate(itr, min, max, nil)
+	return e.DeleteSeriesRangeWithPredicate(itr, func(name []byte, tags models.Tags) (int64, int64, bool) {
+		return min, max, true
+	})
 }
 
 // DeleteSeriesRangeWithPredicate removes the values between min and max (inclusive) from all series
 // for which predicate() returns true. If predicate() is nil, then all values in range are removed.
-func (e *Engine) DeleteSeriesRangeWithPredicate(itr tsdb.SeriesIterator, min, max int64, predicate func(name []byte, tags models.Tags) bool) error {
+func (e *Engine) DeleteSeriesRangeWithPredicate(itr tsdb.SeriesIterator, predicate func(name []byte, tags models.Tags) (int64, int64, bool)) error {
 	var disableOnce bool
 
 	// Ensure that the index does not compact away the measurement or series we're
@@ -1275,7 +1383,24 @@ func (e *Engine) DeleteSeriesRangeWithPredicate(itr tsdb.SeriesIterator, min, ma
 		defer fs.Release()
 	}
 
-	var sz int
+	var (
+		sz       int
+		min, max int64 = math.MinInt64, math.MaxInt64
+
+		// Indicator that the min/max time for the current batch has changed and
+		// we need to flush the current batch before appending to it.
+		flushBatch bool
+	)
+
+	// These are reversed from min/max to ensure they are different the first time through.
+	newMin, newMax := int64(math.MaxInt64), int64(math.MinInt64)
+
+	// There is no predicate, so setup newMin/newMax to delete the full time range.
+	if predicate == nil {
+		newMin = min
+		newMax = max
+	}
+
 	batch := make([][]byte, 0, 10000)
 	for {
 		elem, err := itr.Next()
@@ -1283,8 +1408,19 @@ func (e *Engine) DeleteSeriesRangeWithPredicate(itr tsdb.SeriesIterator, min, ma
 			return err
 		} else if elem == nil {
 			break
-		} else if predicate != nil && !predicate(elem.Name(), elem.Tags()) {
-			continue
+		}
+
+		// See if the series should be deleted and if so, what range of time.
+		if predicate != nil {
+			var shouldDelete bool
+			newMin, newMax, shouldDelete = predicate(elem.Name(), elem.Tags())
+			if !shouldDelete {
+				continue
+			}
+
+			// If the min/max happens to change for the batch, we need to flush
+			// the current batch and start a new one.
+			flushBatch = (min != newMin || max != newMax) && len(batch) > 0
 		}
 
 		if elem.Expr() != nil {
@@ -1310,18 +1446,23 @@ func (e *Engine) DeleteSeriesRangeWithPredicate(itr tsdb.SeriesIterator, min, ma
 			disableOnce = true
 		}
 
-		key := models.MakeKey(elem.Name(), elem.Tags())
-		sz += len(key)
-		batch = append(batch, key)
-
-		if sz >= deleteFlushThreshold {
+		if sz >= deleteFlushThreshold || flushBatch {
 			// Delete all matching batch.
 			if err := e.deleteSeriesRange(batch, min, max); err != nil {
 				return err
 			}
 			batch = batch[:0]
 			sz = 0
+			flushBatch = false
 		}
+
+		// Use the new min/max time for the next iteration
+		min = newMin
+		max = newMax
+
+		key := models.MakeKey(elem.Name(), elem.Tags())
+		sz += len(key)
+		batch = append(batch, key)
 	}
 
 	if len(batch) > 0 {
@@ -1339,7 +1480,6 @@ func (e *Engine) DeleteSeriesRangeWithPredicate(itr tsdb.SeriesIterator, min, ma
 // does not update the index or disable compactions.  This should mainly be called by DeleteSeriesRange
 // and not directly.
 func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
-	ts := time.Now().UTC().UnixNano()
 	if len(seriesKeys) == 0 {
 		return nil
 	}
@@ -1551,7 +1691,7 @@ func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 			// the global index (all shards).
 			if index, ok := e.index.(*inmem.ShardIndex); ok {
 				key := models.MakeKey(name, tags)
-				if e := index.Index.DropSeriesGlobal(key, ts); e != nil {
+				if e := index.Index.DropSeriesGlobal(key); e != nil {
 					err = e
 				}
 			}
@@ -1653,25 +1793,27 @@ func (e *Engine) WriteSnapshot() error {
 		logEnd()
 	}()
 
-	closedFiles, snapshot, err := func() ([]string, *Cache, error) {
+	closedFiles, snapshot, err := func() (segments []string, snapshot *Cache, err error) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
-		if err := e.WAL.CloseSegment(); err != nil {
-			return nil, nil, err
+		if e.WALEnabled {
+			if err = e.WAL.CloseSegment(); err != nil {
+				return
+			}
+
+			segments, err = e.WAL.ClosedSegments()
+			if err != nil {
+				return
+			}
 		}
 
-		segments, err := e.WAL.ClosedSegments()
+		snapshot, err = e.Cache.Snapshot()
 		if err != nil {
-			return nil, nil, err
+			return
 		}
 
-		snapshot, err := e.Cache.Snapshot()
-		if err != nil {
-			return nil, nil, err
-		}
-
-		return segments, snapshot, nil
+		return
 	}()
 
 	if err != nil {
@@ -1740,8 +1882,10 @@ func (e *Engine) writeSnapshotAndCommit(log *zap.Logger, closedFiles []string, s
 	// clear the snapshot from the in-memory cache, then the old WAL files
 	e.Cache.ClearSnapshot(true)
 
-	if err := e.WAL.Remove(closedFiles); err != nil {
-		log.Info("Error removing closed WAL segments", zap.Error(err))
+	if e.WALEnabled {
+		if err := e.WAL.Remove(closedFiles); err != nil {
+			log.Info("Error removing closed WAL segments", zap.Error(err))
+		}
 	}
 
 	return nil
@@ -1762,7 +1906,7 @@ func (e *Engine) compactCache() {
 
 		case <-t.C:
 			e.Cache.UpdateAge()
-			if e.ShouldCompactCache(e.WAL.LastWriteTime()) {
+			if e.ShouldCompactCache(time.Now()) {
 				start := time.Now()
 				e.traceLogger.Info("Compacting cache", zap.String("path", e.path))
 				err := e.WriteSnapshot()
@@ -1780,15 +1924,18 @@ func (e *Engine) compactCache() {
 
 // ShouldCompactCache returns true if the Cache is over its flush threshold
 // or if the passed in lastWriteTime is older than the write cold threshold.
-func (e *Engine) ShouldCompactCache(lastWriteTime time.Time) bool {
+func (e *Engine) ShouldCompactCache(t time.Time) bool {
 	sz := e.Cache.Size()
 
 	if sz == 0 {
 		return false
 	}
 
-	return sz > e.CacheFlushMemorySizeThreshold ||
-		(e.WALEnabled && time.Since(lastWriteTime) > e.CacheFlushWriteColdDuration)
+	if sz > e.CacheFlushMemorySizeThreshold {
+		return true
+	}
+
+	return t.Sub(e.Cache.LastWriteTime()) > e.CacheFlushWriteColdDuration
 }
 
 func (e *Engine) compact(wg *sync.WaitGroup) {
@@ -2206,7 +2353,7 @@ func (e *Engine) createCallIterator(ctx context.Context, measurement string, cal
 		tagSets []*query.TagSet
 		err     error
 	)
-	if e.index.Type() == "inmem" {
+	if e.index.Type() == tsdb.InmemIndexName {
 		ts := e.index.(indexTagSets)
 		tagSets, err = ts.TagSets([]byte(measurement), opt)
 	} else {
@@ -2286,7 +2433,7 @@ func (e *Engine) createVarRefIterator(ctx context.Context, measurement string, o
 		tagSets []*query.TagSet
 		err     error
 	)
-	if e.index.Type() == "inmem" {
+	if e.index.Type() == tsdb.InmemIndexName {
 		ts := e.index.(indexTagSets)
 		tagSets, err = ts.TagSets([]byte(measurement), opt)
 	} else {
@@ -2805,6 +2952,32 @@ func (e *Engine) IteratorCost(measurement string, opt query.IteratorOptions) (qu
 		}
 	}
 	return cost, nil
+}
+
+// Type returns FieldType for a series.  If the series does not
+// exist, ErrUnkownFieldType is returned.
+func (e *Engine) Type(series []byte) (models.FieldType, error) {
+	if typ, err := e.Cache.Type(series); err == nil {
+		return typ, nil
+	}
+
+	typ, err := e.FileStore.Type(series)
+	if err != nil {
+		return 0, err
+	}
+	switch typ {
+	case BlockFloat64:
+		return models.Float, nil
+	case BlockInteger:
+		return models.Integer, nil
+	case BlockUnsigned:
+		return models.Unsigned, nil
+	case BlockString:
+		return models.String, nil
+	case BlockBoolean:
+		return models.Boolean, nil
+	}
+	return 0, tsdb.ErrUnknownFieldType
 }
 
 func (e *Engine) seriesCost(seriesKey, field string, tmin, tmax int64) query.IteratorCost {

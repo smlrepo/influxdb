@@ -495,12 +495,12 @@ type floatSortedMergeHeapItem struct {
 type floatIteratorScanner struct {
 	input        *bufFloatIterator
 	err          error
-	keys         []string
+	keys         []influxql.VarRef
 	defaultValue interface{}
 }
 
 // newFloatIteratorScanner creates a new IteratorScanner.
-func newFloatIteratorScanner(input FloatIterator, keys []string, defaultValue interface{}) *floatIteratorScanner {
+func newFloatIteratorScanner(input FloatIterator, keys []influxql.VarRef, defaultValue interface{}) *floatIteratorScanner {
 	return &floatIteratorScanner{
 		input:        newBufFloatIterator(input),
 		keys:         keys,
@@ -541,24 +541,24 @@ func (s *floatIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map[st
 		return
 	}
 
-	if k := s.keys[0]; k != "" {
+	if k := s.keys[0]; k.Val != "" {
 		if p.Nil {
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		} else {
-			m[k] = p.Value
+			m[k.Val] = p.Value
 		}
 	}
 	for i, v := range p.Aux {
 		k := s.keys[i+1]
 		switch v.(type) {
 		case float64, int64, uint64, string, bool:
-			m[k] = v
+			m[k.Val] = v
 		default:
 			// Insert the fill value if one was specified.
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		}
 	}
@@ -569,10 +569,10 @@ func (s *floatIteratorScanner) useDefaults(m map[string]interface{}) {
 		return
 	}
 	for _, k := range s.keys {
-		if k == "" {
+		if k.Val == "" {
 			continue
 		}
-		m[k] = s.defaultValue
+		m[k.Val] = castToType(s.defaultValue, k.Type)
 	}
 }
 
@@ -844,7 +844,7 @@ CONSTRUCT:
 		case influxql.NullFill:
 			p.Nil = true
 		case influxql.NumberFill:
-			p.Value = castToFloat(itr.opt.FillValue)
+			p.Value, _ = castToFloat(itr.opt.FillValue)
 		case influxql.PreviousFill:
 			if !itr.prev.Nil {
 				p.Value = itr.prev.Value
@@ -2410,7 +2410,7 @@ func (itr *floatIteratorMapper) Next() (*FloatPoint, error) {
 
 	if itr.driver != nil {
 		if v := itr.driver.Value(&itr.row); v != nil {
-			if v, ok := v.(float64); ok {
+			if v, ok := castToFloat(v); ok {
 				itr.point.Value = v
 				itr.point.Nil = false
 			} else {
@@ -2493,6 +2493,49 @@ func (itr *floatFilterIterator) Next() (*FloatPoint, error) {
 		}
 		return p, nil
 	}
+}
+
+type floatTagSubsetIterator struct {
+	input      FloatIterator
+	point      FloatPoint
+	lastTags   Tags
+	dimensions []string
+}
+
+func newFloatTagSubsetIterator(input FloatIterator, opt IteratorOptions) *floatTagSubsetIterator {
+	return &floatTagSubsetIterator{
+		input:      input,
+		dimensions: opt.GetDimensions(),
+	}
+}
+
+func (itr *floatTagSubsetIterator) Next() (*FloatPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p == nil {
+		return nil, nil
+	}
+
+	itr.point.Name = p.Name
+	if !p.Tags.Equal(itr.lastTags) {
+		itr.point.Tags = p.Tags.Subset(itr.dimensions)
+		itr.lastTags = p.Tags
+	}
+	itr.point.Time = p.Time
+	itr.point.Value = p.Value
+	itr.point.Aux = p.Aux
+	itr.point.Aggregated = p.Aggregated
+	itr.point.Nil = p.Nil
+	return &itr.point, nil
+}
+
+func (itr *floatTagSubsetIterator) Stats() IteratorStats {
+	return itr.input.Stats()
+}
+
+func (itr *floatTagSubsetIterator) Close() error {
+	return itr.input.Close()
 }
 
 // newFloatDedupeIterator returns a new instance of floatDedupeIterator.
@@ -3051,12 +3094,12 @@ type integerSortedMergeHeapItem struct {
 type integerIteratorScanner struct {
 	input        *bufIntegerIterator
 	err          error
-	keys         []string
+	keys         []influxql.VarRef
 	defaultValue interface{}
 }
 
 // newIntegerIteratorScanner creates a new IteratorScanner.
-func newIntegerIteratorScanner(input IntegerIterator, keys []string, defaultValue interface{}) *integerIteratorScanner {
+func newIntegerIteratorScanner(input IntegerIterator, keys []influxql.VarRef, defaultValue interface{}) *integerIteratorScanner {
 	return &integerIteratorScanner{
 		input:        newBufIntegerIterator(input),
 		keys:         keys,
@@ -3097,24 +3140,24 @@ func (s *integerIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map[
 		return
 	}
 
-	if k := s.keys[0]; k != "" {
+	if k := s.keys[0]; k.Val != "" {
 		if p.Nil {
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		} else {
-			m[k] = p.Value
+			m[k.Val] = p.Value
 		}
 	}
 	for i, v := range p.Aux {
 		k := s.keys[i+1]
 		switch v.(type) {
 		case float64, int64, uint64, string, bool:
-			m[k] = v
+			m[k.Val] = v
 		default:
 			// Insert the fill value if one was specified.
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		}
 	}
@@ -3125,10 +3168,10 @@ func (s *integerIteratorScanner) useDefaults(m map[string]interface{}) {
 		return
 	}
 	for _, k := range s.keys {
-		if k == "" {
+		if k.Val == "" {
 			continue
 		}
-		m[k] = s.defaultValue
+		m[k.Val] = castToType(s.defaultValue, k.Type)
 	}
 }
 
@@ -3400,7 +3443,7 @@ CONSTRUCT:
 		case influxql.NullFill:
 			p.Nil = true
 		case influxql.NumberFill:
-			p.Value = castToInteger(itr.opt.FillValue)
+			p.Value, _ = castToInteger(itr.opt.FillValue)
 		case influxql.PreviousFill:
 			if !itr.prev.Nil {
 				p.Value = itr.prev.Value
@@ -4966,7 +5009,7 @@ func (itr *integerIteratorMapper) Next() (*IntegerPoint, error) {
 
 	if itr.driver != nil {
 		if v := itr.driver.Value(&itr.row); v != nil {
-			if v, ok := v.(int64); ok {
+			if v, ok := castToInteger(v); ok {
 				itr.point.Value = v
 				itr.point.Nil = false
 			} else {
@@ -5049,6 +5092,49 @@ func (itr *integerFilterIterator) Next() (*IntegerPoint, error) {
 		}
 		return p, nil
 	}
+}
+
+type integerTagSubsetIterator struct {
+	input      IntegerIterator
+	point      IntegerPoint
+	lastTags   Tags
+	dimensions []string
+}
+
+func newIntegerTagSubsetIterator(input IntegerIterator, opt IteratorOptions) *integerTagSubsetIterator {
+	return &integerTagSubsetIterator{
+		input:      input,
+		dimensions: opt.GetDimensions(),
+	}
+}
+
+func (itr *integerTagSubsetIterator) Next() (*IntegerPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p == nil {
+		return nil, nil
+	}
+
+	itr.point.Name = p.Name
+	if !p.Tags.Equal(itr.lastTags) {
+		itr.point.Tags = p.Tags.Subset(itr.dimensions)
+		itr.lastTags = p.Tags
+	}
+	itr.point.Time = p.Time
+	itr.point.Value = p.Value
+	itr.point.Aux = p.Aux
+	itr.point.Aggregated = p.Aggregated
+	itr.point.Nil = p.Nil
+	return &itr.point, nil
+}
+
+func (itr *integerTagSubsetIterator) Stats() IteratorStats {
+	return itr.input.Stats()
+}
+
+func (itr *integerTagSubsetIterator) Close() error {
+	return itr.input.Close()
 }
 
 // newIntegerDedupeIterator returns a new instance of integerDedupeIterator.
@@ -5607,12 +5693,12 @@ type unsignedSortedMergeHeapItem struct {
 type unsignedIteratorScanner struct {
 	input        *bufUnsignedIterator
 	err          error
-	keys         []string
+	keys         []influxql.VarRef
 	defaultValue interface{}
 }
 
 // newUnsignedIteratorScanner creates a new IteratorScanner.
-func newUnsignedIteratorScanner(input UnsignedIterator, keys []string, defaultValue interface{}) *unsignedIteratorScanner {
+func newUnsignedIteratorScanner(input UnsignedIterator, keys []influxql.VarRef, defaultValue interface{}) *unsignedIteratorScanner {
 	return &unsignedIteratorScanner{
 		input:        newBufUnsignedIterator(input),
 		keys:         keys,
@@ -5653,24 +5739,24 @@ func (s *unsignedIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map
 		return
 	}
 
-	if k := s.keys[0]; k != "" {
+	if k := s.keys[0]; k.Val != "" {
 		if p.Nil {
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		} else {
-			m[k] = p.Value
+			m[k.Val] = p.Value
 		}
 	}
 	for i, v := range p.Aux {
 		k := s.keys[i+1]
 		switch v.(type) {
 		case float64, int64, uint64, string, bool:
-			m[k] = v
+			m[k.Val] = v
 		default:
 			// Insert the fill value if one was specified.
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		}
 	}
@@ -5681,10 +5767,10 @@ func (s *unsignedIteratorScanner) useDefaults(m map[string]interface{}) {
 		return
 	}
 	for _, k := range s.keys {
-		if k == "" {
+		if k.Val == "" {
 			continue
 		}
-		m[k] = s.defaultValue
+		m[k.Val] = castToType(s.defaultValue, k.Type)
 	}
 }
 
@@ -5956,7 +6042,7 @@ CONSTRUCT:
 		case influxql.NullFill:
 			p.Nil = true
 		case influxql.NumberFill:
-			p.Value = castToUnsigned(itr.opt.FillValue)
+			p.Value, _ = castToUnsigned(itr.opt.FillValue)
 		case influxql.PreviousFill:
 			if !itr.prev.Nil {
 				p.Value = itr.prev.Value
@@ -7522,7 +7608,7 @@ func (itr *unsignedIteratorMapper) Next() (*UnsignedPoint, error) {
 
 	if itr.driver != nil {
 		if v := itr.driver.Value(&itr.row); v != nil {
-			if v, ok := v.(uint64); ok {
+			if v, ok := castToUnsigned(v); ok {
 				itr.point.Value = v
 				itr.point.Nil = false
 			} else {
@@ -7605,6 +7691,49 @@ func (itr *unsignedFilterIterator) Next() (*UnsignedPoint, error) {
 		}
 		return p, nil
 	}
+}
+
+type unsignedTagSubsetIterator struct {
+	input      UnsignedIterator
+	point      UnsignedPoint
+	lastTags   Tags
+	dimensions []string
+}
+
+func newUnsignedTagSubsetIterator(input UnsignedIterator, opt IteratorOptions) *unsignedTagSubsetIterator {
+	return &unsignedTagSubsetIterator{
+		input:      input,
+		dimensions: opt.GetDimensions(),
+	}
+}
+
+func (itr *unsignedTagSubsetIterator) Next() (*UnsignedPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p == nil {
+		return nil, nil
+	}
+
+	itr.point.Name = p.Name
+	if !p.Tags.Equal(itr.lastTags) {
+		itr.point.Tags = p.Tags.Subset(itr.dimensions)
+		itr.lastTags = p.Tags
+	}
+	itr.point.Time = p.Time
+	itr.point.Value = p.Value
+	itr.point.Aux = p.Aux
+	itr.point.Aggregated = p.Aggregated
+	itr.point.Nil = p.Nil
+	return &itr.point, nil
+}
+
+func (itr *unsignedTagSubsetIterator) Stats() IteratorStats {
+	return itr.input.Stats()
+}
+
+func (itr *unsignedTagSubsetIterator) Close() error {
+	return itr.input.Close()
 }
 
 // newUnsignedDedupeIterator returns a new instance of unsignedDedupeIterator.
@@ -8163,12 +8292,12 @@ type stringSortedMergeHeapItem struct {
 type stringIteratorScanner struct {
 	input        *bufStringIterator
 	err          error
-	keys         []string
+	keys         []influxql.VarRef
 	defaultValue interface{}
 }
 
 // newStringIteratorScanner creates a new IteratorScanner.
-func newStringIteratorScanner(input StringIterator, keys []string, defaultValue interface{}) *stringIteratorScanner {
+func newStringIteratorScanner(input StringIterator, keys []influxql.VarRef, defaultValue interface{}) *stringIteratorScanner {
 	return &stringIteratorScanner{
 		input:        newBufStringIterator(input),
 		keys:         keys,
@@ -8209,24 +8338,24 @@ func (s *stringIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map[s
 		return
 	}
 
-	if k := s.keys[0]; k != "" {
+	if k := s.keys[0]; k.Val != "" {
 		if p.Nil {
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		} else {
-			m[k] = p.Value
+			m[k.Val] = p.Value
 		}
 	}
 	for i, v := range p.Aux {
 		k := s.keys[i+1]
 		switch v.(type) {
 		case float64, int64, uint64, string, bool:
-			m[k] = v
+			m[k.Val] = v
 		default:
 			// Insert the fill value if one was specified.
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		}
 	}
@@ -8237,10 +8366,10 @@ func (s *stringIteratorScanner) useDefaults(m map[string]interface{}) {
 		return
 	}
 	for _, k := range s.keys {
-		if k == "" {
+		if k.Val == "" {
 			continue
 		}
-		m[k] = s.defaultValue
+		m[k.Val] = castToType(s.defaultValue, k.Type)
 	}
 }
 
@@ -8498,7 +8627,7 @@ CONSTRUCT:
 		case influxql.NullFill:
 			p.Nil = true
 		case influxql.NumberFill:
-			p.Value = castToString(itr.opt.FillValue)
+			p.Value, _ = castToString(itr.opt.FillValue)
 		case influxql.PreviousFill:
 			if !itr.prev.Nil {
 				p.Value = itr.prev.Value
@@ -10064,7 +10193,7 @@ func (itr *stringIteratorMapper) Next() (*StringPoint, error) {
 
 	if itr.driver != nil {
 		if v := itr.driver.Value(&itr.row); v != nil {
-			if v, ok := v.(string); ok {
+			if v, ok := castToString(v); ok {
 				itr.point.Value = v
 				itr.point.Nil = false
 			} else {
@@ -10147,6 +10276,49 @@ func (itr *stringFilterIterator) Next() (*StringPoint, error) {
 		}
 		return p, nil
 	}
+}
+
+type stringTagSubsetIterator struct {
+	input      StringIterator
+	point      StringPoint
+	lastTags   Tags
+	dimensions []string
+}
+
+func newStringTagSubsetIterator(input StringIterator, opt IteratorOptions) *stringTagSubsetIterator {
+	return &stringTagSubsetIterator{
+		input:      input,
+		dimensions: opt.GetDimensions(),
+	}
+}
+
+func (itr *stringTagSubsetIterator) Next() (*StringPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p == nil {
+		return nil, nil
+	}
+
+	itr.point.Name = p.Name
+	if !p.Tags.Equal(itr.lastTags) {
+		itr.point.Tags = p.Tags.Subset(itr.dimensions)
+		itr.lastTags = p.Tags
+	}
+	itr.point.Time = p.Time
+	itr.point.Value = p.Value
+	itr.point.Aux = p.Aux
+	itr.point.Aggregated = p.Aggregated
+	itr.point.Nil = p.Nil
+	return &itr.point, nil
+}
+
+func (itr *stringTagSubsetIterator) Stats() IteratorStats {
+	return itr.input.Stats()
+}
+
+func (itr *stringTagSubsetIterator) Close() error {
+	return itr.input.Close()
 }
 
 // newStringDedupeIterator returns a new instance of stringDedupeIterator.
@@ -10705,12 +10877,12 @@ type booleanSortedMergeHeapItem struct {
 type booleanIteratorScanner struct {
 	input        *bufBooleanIterator
 	err          error
-	keys         []string
+	keys         []influxql.VarRef
 	defaultValue interface{}
 }
 
 // newBooleanIteratorScanner creates a new IteratorScanner.
-func newBooleanIteratorScanner(input BooleanIterator, keys []string, defaultValue interface{}) *booleanIteratorScanner {
+func newBooleanIteratorScanner(input BooleanIterator, keys []influxql.VarRef, defaultValue interface{}) *booleanIteratorScanner {
 	return &booleanIteratorScanner{
 		input:        newBufBooleanIterator(input),
 		keys:         keys,
@@ -10751,24 +10923,24 @@ func (s *booleanIteratorScanner) ScanAt(ts int64, name string, tags Tags, m map[
 		return
 	}
 
-	if k := s.keys[0]; k != "" {
+	if k := s.keys[0]; k.Val != "" {
 		if p.Nil {
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		} else {
-			m[k] = p.Value
+			m[k.Val] = p.Value
 		}
 	}
 	for i, v := range p.Aux {
 		k := s.keys[i+1]
 		switch v.(type) {
 		case float64, int64, uint64, string, bool:
-			m[k] = v
+			m[k.Val] = v
 		default:
 			// Insert the fill value if one was specified.
 			if s.defaultValue != SkipDefault {
-				m[k] = s.defaultValue
+				m[k.Val] = castToType(s.defaultValue, k.Type)
 			}
 		}
 	}
@@ -10779,10 +10951,10 @@ func (s *booleanIteratorScanner) useDefaults(m map[string]interface{}) {
 		return
 	}
 	for _, k := range s.keys {
-		if k == "" {
+		if k.Val == "" {
 			continue
 		}
-		m[k] = s.defaultValue
+		m[k.Val] = castToType(s.defaultValue, k.Type)
 	}
 }
 
@@ -11040,7 +11212,7 @@ CONSTRUCT:
 		case influxql.NullFill:
 			p.Nil = true
 		case influxql.NumberFill:
-			p.Value = castToBoolean(itr.opt.FillValue)
+			p.Value, _ = castToBoolean(itr.opt.FillValue)
 		case influxql.PreviousFill:
 			if !itr.prev.Nil {
 				p.Value = itr.prev.Value
@@ -12606,7 +12778,7 @@ func (itr *booleanIteratorMapper) Next() (*BooleanPoint, error) {
 
 	if itr.driver != nil {
 		if v := itr.driver.Value(&itr.row); v != nil {
-			if v, ok := v.(bool); ok {
+			if v, ok := castToBoolean(v); ok {
 				itr.point.Value = v
 				itr.point.Nil = false
 			} else {
@@ -12689,6 +12861,49 @@ func (itr *booleanFilterIterator) Next() (*BooleanPoint, error) {
 		}
 		return p, nil
 	}
+}
+
+type booleanTagSubsetIterator struct {
+	input      BooleanIterator
+	point      BooleanPoint
+	lastTags   Tags
+	dimensions []string
+}
+
+func newBooleanTagSubsetIterator(input BooleanIterator, opt IteratorOptions) *booleanTagSubsetIterator {
+	return &booleanTagSubsetIterator{
+		input:      input,
+		dimensions: opt.GetDimensions(),
+	}
+}
+
+func (itr *booleanTagSubsetIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p == nil {
+		return nil, nil
+	}
+
+	itr.point.Name = p.Name
+	if !p.Tags.Equal(itr.lastTags) {
+		itr.point.Tags = p.Tags.Subset(itr.dimensions)
+		itr.lastTags = p.Tags
+	}
+	itr.point.Time = p.Time
+	itr.point.Value = p.Value
+	itr.point.Aux = p.Aux
+	itr.point.Aggregated = p.Aggregated
+	itr.point.Nil = p.Nil
+	return &itr.point, nil
+}
+
+func (itr *booleanTagSubsetIterator) Stats() IteratorStats {
+	return itr.input.Stats()
+}
+
+func (itr *booleanTagSubsetIterator) Close() error {
+	return itr.input.Close()
 }
 
 // newBooleanDedupeIterator returns a new instance of booleanDedupeIterator.

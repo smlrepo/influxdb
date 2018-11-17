@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap"
 )
 
-type StorageMetaClient interface {
+type MetaClient interface {
 	Database(name string) *meta.DatabaseInfo
 	ShardGroupsByTimeRange(database, policy string, min, max time.Time) (a []meta.ShardGroupInfo, err error)
 }
@@ -16,13 +16,13 @@ type StorageMetaClient interface {
 // Service manages the listener and handler for an HTTP endpoint.
 type Service struct {
 	addr           string
-	yarpc          *yarpcServer
+	grpc           *grpcServer
 	loggingEnabled bool
 	logger         *zap.Logger
 
-	Store      *Store
+	Store      *localStore
 	TSDBStore  *tsdb.Store
-	MetaClient StorageMetaClient
+	MetaClient MetaClient
 }
 
 // NewService returns a new instance of Service.
@@ -45,30 +45,28 @@ func (s *Service) WithLogger(log *zap.Logger) {
 func (s *Service) Open() error {
 	s.logger.Info("Starting storage service")
 
-	store := NewStore()
-	store.TSDBStore = s.TSDBStore
-	store.MetaClient = s.MetaClient
-	store.Logger = s.logger
+	store := NewStore(s.TSDBStore, s.MetaClient)
+	s.WithLogger(s.logger)
 
-	yarpc := &yarpcServer{
+	grpc := &grpcServer{
 		addr:           s.addr,
 		loggingEnabled: s.loggingEnabled,
 		logger:         s.logger,
 		store:          store,
 	}
-	if err := yarpc.Open(); err != nil {
+	if err := grpc.Open(); err != nil {
 		return err
 	}
 
-	s.yarpc = yarpc
+	s.grpc = grpc
 
 	return nil
 }
 
 func (s *Service) Close() error {
-	if s.yarpc != nil {
-		s.yarpc.Close()
-		s.yarpc = nil
+	if s.grpc != nil {
+		s.grpc.Close()
+		s.grpc = nil
 	}
 
 	return nil

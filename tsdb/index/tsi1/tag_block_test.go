@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxdb/tsdb/index/tsi1"
 )
 
@@ -17,19 +18,19 @@ func TestTagBlockWriter(t *testing.T) {
 
 	if err := enc.EncodeKey([]byte("host"), false); err != nil {
 		t.Fatal(err)
-	} else if err := enc.EncodeValue([]byte("server0"), false, []uint64{1}); err != nil {
+	} else if err := enc.EncodeValue([]byte("server0"), false, tsdb.NewSeriesIDSet(1)); err != nil {
 		t.Fatal(err)
-	} else if err := enc.EncodeValue([]byte("server1"), false, []uint64{2}); err != nil {
+	} else if err := enc.EncodeValue([]byte("server1"), false, tsdb.NewSeriesIDSet(2)); err != nil {
 		t.Fatal(err)
-	} else if err := enc.EncodeValue([]byte("server2"), false, []uint64{3}); err != nil {
+	} else if err := enc.EncodeValue([]byte("server2"), false, tsdb.NewSeriesIDSet(3)); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := enc.EncodeKey([]byte("region"), false); err != nil {
 		t.Fatal(err)
-	} else if err := enc.EncodeValue([]byte("us-east"), false, []uint64{1, 2}); err != nil {
+	} else if err := enc.EncodeValue([]byte("us-east"), false, tsdb.NewSeriesIDSet(1, 2)); err != nil {
 		t.Fatal(err)
-	} else if err := enc.EncodeValue([]byte("us-west"), false, []uint64{3}); err != nil {
+	} else if err := enc.EncodeValue([]byte("us-west"), false, tsdb.NewSeriesIDSet(3)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -49,28 +50,38 @@ func TestTagBlockWriter(t *testing.T) {
 	// Verify data.
 	if e := blk.TagValueElem([]byte("region"), []byte("us-east")); e == nil {
 		t.Fatal("expected element")
-	} else if a := e.(*tsi1.TagBlockValueElem).SeriesIDs(); !reflect.DeepEqual(a, []uint64{1, 2}) {
+	} else if a, err := e.(*tsi1.TagBlockValueElem).SeriesIDs(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !reflect.DeepEqual(a, []uint64{1, 2}) {
 		t.Fatalf("unexpected series ids: %#v", a)
 	}
 
 	if e := blk.TagValueElem([]byte("region"), []byte("us-west")); e == nil {
 		t.Fatal("expected element")
-	} else if a := e.(*tsi1.TagBlockValueElem).SeriesIDs(); !reflect.DeepEqual(a, []uint64{3}) {
+	} else if a, err := e.(*tsi1.TagBlockValueElem).SeriesIDs(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !reflect.DeepEqual(a, []uint64{3}) {
 		t.Fatalf("unexpected series ids: %#v", a)
 	}
 	if e := blk.TagValueElem([]byte("host"), []byte("server0")); e == nil {
 		t.Fatal("expected element")
-	} else if a := e.(*tsi1.TagBlockValueElem).SeriesIDs(); !reflect.DeepEqual(a, []uint64{1}) {
+	} else if a, err := e.(*tsi1.TagBlockValueElem).SeriesIDs(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !reflect.DeepEqual(a, []uint64{1}) {
 		t.Fatalf("unexpected series ids: %#v", a)
 	}
 	if e := blk.TagValueElem([]byte("host"), []byte("server1")); e == nil {
 		t.Fatal("expected element")
-	} else if a := e.(*tsi1.TagBlockValueElem).SeriesIDs(); !reflect.DeepEqual(a, []uint64{2}) {
+	} else if a, err := e.(*tsi1.TagBlockValueElem).SeriesIDs(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !reflect.DeepEqual(a, []uint64{2}) {
 		t.Fatalf("unexpected series ids: %#v", a)
 	}
 	if e := blk.TagValueElem([]byte("host"), []byte("server2")); e == nil {
 		t.Fatal("expected element")
-	} else if a := e.(*tsi1.TagBlockValueElem).SeriesIDs(); !reflect.DeepEqual(a, []uint64{3}) {
+	} else if a, err := e.(*tsi1.TagBlockValueElem).SeriesIDs(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if !reflect.DeepEqual(a, []uint64{3}) {
 		t.Fatalf("unexpected series ids: %#v", a)
 	}
 }
@@ -105,7 +116,7 @@ func benchmarkTagBlock_SeriesN(b *testing.B, tagN, valueN int, blk **tsi1.TagBlo
 			}
 
 			for j := 0; j < valueN; j++ {
-				if err := enc.EncodeValue([]byte(fmt.Sprintf("%08d", j)), false, []uint64{1}); err != nil {
+				if err := enc.EncodeValue([]byte(fmt.Sprintf("%08d", j)), false, tsdb.NewSeriesIDSet(1)); err != nil {
 					b.Fatal(err)
 				}
 			}

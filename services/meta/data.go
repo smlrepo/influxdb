@@ -871,7 +871,7 @@ func (data *Data) importOneDB(other Data, backupDBName, restoreDBName, backupRPN
 		for j, sgImport := range rpImport.ShardGroups {
 			data.MaxShardGroupID++
 			rpImport.ShardGroups[j].ID = data.MaxShardGroupID
-			for k, _ := range sgImport.Shards {
+			for k := range sgImport.Shards {
 				data.MaxShardID++
 				shardIDMap[sgImport.Shards[k].ID] = data.MaxShardID
 				sgImport.Shards[k].ID = data.MaxShardID
@@ -1321,9 +1321,9 @@ func (a ShardGroupInfos) Less(i, j int) bool {
 	return iEnd.Before(jEnd)
 }
 
-// Contains returns true if the shard group contains data for the timestamp.
-func (sgi *ShardGroupInfo) Contains(timestamp time.Time) bool {
-	return !sgi.StartTime.After(timestamp) && sgi.EndTime.After(timestamp)
+// Contains returns true iif StartTime ≤ t < EndTime.
+func (sgi *ShardGroupInfo) Contains(t time.Time) bool {
+	return !t.Before(sgi.StartTime) && t.Before(sgi.EndTime)
 }
 
 // Overlaps returns whether the shard group contains data for the time range between min and max
@@ -1579,6 +1579,7 @@ type UserInfo struct {
 type User interface {
 	query.Authorizer
 	ID() string
+	AuthorizeUnrestricted() bool
 }
 
 func (u *UserInfo) ID() string {
@@ -1602,6 +1603,11 @@ func (u *UserInfo) AuthorizeSeriesRead(database string, measurement []byte, tags
 // AuthorizeSeriesWrite is used to limit access per-series (enterprise only)
 func (u *UserInfo) AuthorizeSeriesWrite(database string, measurement []byte, tags models.Tags) bool {
 	return true
+}
+
+// AuthorizeUnrestricted allows admins to shortcut access checks.
+func (u *UserInfo) AuthorizeUnrestricted() bool {
+	return u.Admin
 }
 
 // clone returns a deep copy of si.

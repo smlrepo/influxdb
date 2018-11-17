@@ -7,8 +7,8 @@
   branch = "master"
 
 [[constraint]]
-  name = "github.com/RoaringBitmap/roaring"
-  version = "0.4.3"
+  name = "github.com/influxdata/roaring"
+  branch = "master"
 
 [[constraint]]
   name = "github.com/boltdb/bolt"
@@ -29,10 +29,6 @@
 [[constraint]]
   name = "github.com/golang/snappy"
   revision = "d9eb7a3d35ec988b8585d4a0068e462c27d28380"
-
-[[constraint]]
-  name = "github.com/influxdata/influxql"
-  revision = "53bc9c15f65bea9e4b9f6cc5d9c5327d4077bdc5"
 
 [[constraint]]
   name = "github.com/mattn/go-isatty"
@@ -66,6 +62,14 @@
   name = "github.com/prometheus/client_golang"
   revision = "661e31bf844dfca9aeba15f27ea8aa0d485ad212"
 
+[[constraint]]
+  name = "github.com/klauspost/pgzip"
+  version = "1.1.0"
+
 [prune]
   go-tests = true
   unused-packages = true
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/influxdata/flux"

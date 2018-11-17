@@ -214,7 +214,7 @@ func (cmd *Command) readFileSet(sfile *tsdb.SeriesFile) (*tsi1.Index, *tsi1.File
 		}
 	}
 
-	fs, err := tsi1.NewFileSet("", nil, sfile, files)
+	fs, err := tsi1.NewFileSet(nil, sfile, files)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -353,7 +353,10 @@ func (cmd *Command) printTagValueSeries(sfile *tsdb.SeriesFile, fs *tsi1.FileSet
 
 	// Iterate over each series.
 	tw := tabwriter.NewWriter(cmd.Stdout, 8, 8, 1, '\t', 0)
-	itr := fs.TagValueSeriesIDIterator(name, key, value)
+	itr, err := fs.TagValueSeriesIDIterator(name, key, value)
+	if err != nil {
+		return err
+	}
 	for {
 		e, err := itr.Next()
 		if err != nil {

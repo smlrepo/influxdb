@@ -1,6 +1,7 @@
 package tsdb_test
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -10,6 +11,43 @@ import (
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/tsdb"
 )
+
+func TestParseSeriesKeyInto(t *testing.T) {
+	name := []byte("cpu")
+	tags := models.NewTags(map[string]string{"region": "east", "server": "a"})
+	key := tsdb.AppendSeriesKey(nil, name, tags)
+
+	dst := make(models.Tags, 0)
+	gotName, gotTags := tsdb.ParseSeriesKeyInto(key, dst)
+
+	if !bytes.Equal(gotName, name) {
+		t.Fatalf("got %q, expected %q", gotName, name)
+	}
+
+	if got, exp := len(gotTags), 2; got != exp {
+		t.Fatalf("got tags length %d, expected %d", got, exp)
+	} else if got, exp := gotTags, tags; !got.Equal(exp) {
+		t.Fatalf("got tags %v, expected %v", got, exp)
+	}
+
+	dst = make(models.Tags, 0, 5)
+	_, gotTags = tsdb.ParseSeriesKeyInto(key, dst)
+	if got, exp := len(gotTags), 2; got != exp {
+		t.Fatalf("got tags length %d, expected %d", got, exp)
+	} else if got, exp := cap(gotTags), 5; got != exp {
+		t.Fatalf("got tags capacity %d, expected %d", got, exp)
+	} else if got, exp := gotTags, tags; !got.Equal(exp) {
+		t.Fatalf("got tags %v, expected %v", got, exp)
+	}
+
+	dst = make(models.Tags, 1)
+	_, gotTags = tsdb.ParseSeriesKeyInto(key, dst)
+	if got, exp := len(gotTags), 2; got != exp {
+		t.Fatalf("got tags length %d, expected %d", got, exp)
+	} else if got, exp := gotTags, tags; !got.Equal(exp) {
+		t.Fatalf("got tags %v, expected %v", got, exp)
+	}
+}
 
 // Ensure series file contains the correct set of series.
 func TestSeriesFile_Series(t *testing.T) {
@@ -22,7 +60,7 @@ func TestSeriesFile_Series(t *testing.T) {
 		{Name: []byte("mem"), Tags: models.NewTags(map[string]string{"region": "east"})},
 	}
 	for _, s := range series {
-		if _, err := sfile.CreateSeriesListIfNotExists([][]byte{[]byte(s.Name)}, []models.Tags{s.Tags}, nil); err != nil {
+		if _, err := sfile.CreateSeriesListIfNotExists([][]byte{[]byte(s.Name)}, []models.Tags{s.Tags}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -61,7 +99,7 @@ func TestSeriesFileCompactor(t *testing.T) {
 		names = append(names, []byte(fmt.Sprintf("m%d", i)))
 		tagsSlice = append(tagsSlice, models.NewTags(map[string]string{"foo": "bar"}))
 	}
-	if _, err := sfile.CreateSeriesListIfNotExists(names, tagsSlice, nil); err != nil {
+	if _, err := sfile.CreateSeriesListIfNotExists(names, tagsSlice); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,6 +121,42 @@ func TestSeriesFileCompactor(t *testing.T) {
 		if seriesID := sfile.SeriesID(names[i], tagsSlice[i], nil); seriesID == 0 {
 			t.Fatalf("series does not exist: %s,%s", names[i], tagsSlice[i].String())
 		}
+	}
+}
+
+// Ensure series file deletions persist across compactions.
+func TestSeriesFile_DeleteSeriesID(t *testing.T) {
+	sfile := MustOpenSeriesFile()
+	defer sfile.Close()
+
+	ids0, err := sfile.CreateSeriesListIfNotExists([][]byte{[]byte("m1")}, []models.Tags{nil})
+	if err != nil {
+		t.Fatal(err)
+	} else if _, err := sfile.CreateSeriesListIfNotExists([][]byte{[]byte("m2")}, []models.Tags{nil}); err != nil {
+		t.Fatal(err)
+	} else if err := sfile.ForceCompact(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete and ensure deletion.
+	if err := sfile.DeleteSeriesID(ids0[0]); err != nil {
+		t.Fatal(err)
+	} else if _, err := sfile.CreateSeriesListIfNotExists([][]byte{[]byte("m1")}, []models.Tags{nil}); err != nil {
+		t.Fatal(err)
+	} else if !sfile.IsDeleted(ids0[0]) {
+		t.Fatal("expected deletion before compaction")
+	}
+
+	if err := sfile.ForceCompact(); err != nil {
+		t.Fatal(err)
+	} else if !sfile.IsDeleted(ids0[0]) {
+		t.Fatal("expected deletion after compaction")
+	}
+
+	if err := sfile.Reopen(); err != nil {
+		t.Fatal(err)
+	} else if !sfile.IsDeleted(ids0[0]) {
+		t.Fatal("expected deletion after reopen")
 	}
 }
 
@@ -121,4 +195,23 @@ func MustOpenSeriesFile() *SeriesFile {
 func (f *SeriesFile) Close() error {
 	defer os.RemoveAll(f.Path())
 	return f.SeriesFile.Close()
+}
+
+// Reopen close & reopens the series file.
+func (f *SeriesFile) Reopen() error {
+	if err := f.SeriesFile.Close(); err != nil {
+		return err
+	}
+	f.SeriesFile = tsdb.NewSeriesFile(f.SeriesFile.Path())
+	return f.SeriesFile.Open()
+}
+
+// ForceCompact executes an immediate compaction across all partitions.
+func (f *SeriesFile) ForceCompact() error {
+	for _, p := range f.Partitions() {
+		if err := tsdb.NewSeriesPartitionCompactor().Compact(p); err != nil {
+			return err
+		}
+	}
+	return nil
 }

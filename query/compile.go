@@ -39,6 +39,16 @@ type compiledStatement struct {
 	// a query that shouldn't have an interval to fail.
 	InheritedInterval bool
 
+	// ExtraIntervals is the number of extra intervals that will be read in addition
+	// to the TimeRange. It is a multiple of Interval and only applies to queries that
+	// have an Interval. It is used to extend the TimeRange of the mapped shards to
+	// include additional non-emitted intervals used by derivative and other functions.
+	// It will be set to the highest number of extra intervals that need to be read even
+	// if it doesn't apply to all functions. The number will always be positive.
+	// This value may be set to a non-zero value even if there is no interval for the
+	// compiled query.
+	ExtraIntervals int
+
 	// Ascending is true if the time ordering is ascending.
 	Ascending bool
 
@@ -250,7 +260,7 @@ func (c *compiledField) compileExpr(expr influxql.Expr) error {
 		return nil
 	case *influxql.Call:
 		if isMathFunction(expr) {
-			return c.compileTrigFunction(expr)
+			return c.compileMathFunction(expr)
 		}
 
 		// Register the function call in the list of function calls.
@@ -275,6 +285,12 @@ func (c *compiledField) compileExpr(expr influxql.Expr) error {
 			return c.compileCumulativeSum(expr.Args)
 		case "moving_average":
 			return c.compileMovingAverage(expr.Args)
+		case "exponential_moving_average", "double_exponential_moving_average", "triple_exponential_moving_average", "relative_strength_index", "triple_exponential_derivative":
+			return c.compileExponentialMovingAverage(expr.Name, expr.Args)
+		case "kaufmans_efficiency_ratio", "kaufmans_adaptive_moving_average":
+			return c.compileKaufmans(expr.Name, expr.Args)
+		case "chande_momentum_oscillator":
+			return c.compileChandeMomentumOscillator(expr.Args)
 		case "elapsed":
 			return c.compileElapsed(expr.Args)
 		case "integral":
@@ -318,6 +334,22 @@ func (c *compiledField) compileExpr(expr influxql.Expr) error {
 		return errors.New("field must contain at least one variable")
 	}
 	return errors.New("unimplemented")
+}
+
+// compileNestedExpr ensures that the expression is compiled as if it were
+// a nested expression.
+func (c *compiledField) compileNestedExpr(expr influxql.Expr) error {
+	// Intercept the distinct call so we can pass nested as true.
+	switch expr := expr.(type) {
+	case *influxql.Call:
+		if expr.Name == "distinct" {
+			return c.compileDistinct(expr.Args, true)
+		}
+	case *influxql.Distinct:
+		call := expr.NewCall()
+		return c.compileDistinct(call.Args, true)
+	}
+	return c.compileExpr(expr)
 }
 
 func (c *compiledField) compileSymbol(name string, field influxql.Expr) error {
@@ -424,6 +456,9 @@ func (c *compiledField) compileDerivative(args []influxql.Expr, isNonNegative bo
 		}
 	}
 	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < 1 {
+		c.global.ExtraIntervals = 1
+	}
 
 	// Must be a variable reference, function, wildcard, or regexp.
 	switch arg0 := args[0].(type) {
@@ -431,9 +466,9 @@ func (c *compiledField) compileDerivative(args []influxql.Expr, isNonNegative bo
 		if c.global.Interval.IsZero() {
 			return fmt.Errorf("%s aggregate requires a GROUP BY interval", name)
 		}
-		return c.compileExpr(arg0)
+		return c.compileNestedExpr(arg0)
 	default:
-		if !c.global.Interval.IsZero() {
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
 			return fmt.Errorf("aggregate function required inside the call to %s", name)
 		}
 		return c.compileSymbol(name, arg0)
@@ -457,6 +492,9 @@ func (c *compiledField) compileElapsed(args []influxql.Expr) error {
 		}
 	}
 	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < 1 {
+		c.global.ExtraIntervals = 1
+	}
 
 	// Must be a variable reference, function, wildcard, or regexp.
 	switch arg0 := args[0].(type) {
@@ -464,9 +502,9 @@ func (c *compiledField) compileElapsed(args []influxql.Expr) error {
 		if c.global.Interval.IsZero() {
 			return fmt.Errorf("elapsed aggregate requires a GROUP BY interval")
 		}
-		return c.compileExpr(arg0)
+		return c.compileNestedExpr(arg0)
 	default:
-		if !c.global.Interval.IsZero() {
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
 			return fmt.Errorf("aggregate function required inside the call to elapsed")
 		}
 		return c.compileSymbol("elapsed", arg0)
@@ -483,6 +521,9 @@ func (c *compiledField) compileDifference(args []influxql.Expr, isNonNegative bo
 		return fmt.Errorf("invalid number of arguments for %s, expected 1, got %d", name, got)
 	}
 	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < 1 {
+		c.global.ExtraIntervals = 1
+	}
 
 	// Must be a variable reference, function, wildcard, or regexp.
 	switch arg0 := args[0].(type) {
@@ -490,9 +531,9 @@ func (c *compiledField) compileDifference(args []influxql.Expr, isNonNegative bo
 		if c.global.Interval.IsZero() {
 			return fmt.Errorf("%s aggregate requires a GROUP BY interval", name)
 		}
-		return c.compileExpr(arg0)
+		return c.compileNestedExpr(arg0)
 	default:
-		if !c.global.Interval.IsZero() {
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
 			return fmt.Errorf("aggregate function required inside the call to %s", name)
 		}
 		return c.compileSymbol(name, arg0)
@@ -504,6 +545,9 @@ func (c *compiledField) compileCumulativeSum(args []influxql.Expr) error {
 		return fmt.Errorf("invalid number of arguments for cumulative_sum, expected 1, got %d", got)
 	}
 	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < 1 {
+		c.global.ExtraIntervals = 1
+	}
 
 	// Must be a variable reference, function, wildcard, or regexp.
 	switch arg0 := args[0].(type) {
@@ -511,9 +555,9 @@ func (c *compiledField) compileCumulativeSum(args []influxql.Expr) error {
 		if c.global.Interval.IsZero() {
 			return fmt.Errorf("cumulative_sum aggregate requires a GROUP BY interval")
 		}
-		return c.compileExpr(arg0)
+		return c.compileNestedExpr(arg0)
 	default:
-		if !c.global.Interval.IsZero() {
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
 			return fmt.Errorf("aggregate function required inside the call to cumulative_sum")
 		}
 		return c.compileSymbol("cumulative_sum", arg0)
@@ -525,15 +569,16 @@ func (c *compiledField) compileMovingAverage(args []influxql.Expr) error {
 		return fmt.Errorf("invalid number of arguments for moving_average, expected 2, got %d", got)
 	}
 
-	switch arg1 := args[1].(type) {
-	case *influxql.IntegerLiteral:
-		if arg1.Val <= 1 {
-			return fmt.Errorf("moving_average window must be greater than 1, got %d", arg1.Val)
-		}
-	default:
+	arg1, ok := args[1].(*influxql.IntegerLiteral)
+	if !ok {
 		return fmt.Errorf("second argument for moving_average must be an integer, got %T", args[1])
+	} else if arg1.Val <= 1 {
+		return fmt.Errorf("moving_average window must be greater than 1, got %d", arg1.Val)
 	}
 	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < int(arg1.Val) {
+		c.global.ExtraIntervals = int(arg1.Val)
+	}
 
 	// Must be a variable reference, function, wildcard, or regexp.
 	switch arg0 := args[0].(type) {
@@ -541,12 +586,167 @@ func (c *compiledField) compileMovingAverage(args []influxql.Expr) error {
 		if c.global.Interval.IsZero() {
 			return fmt.Errorf("moving_average aggregate requires a GROUP BY interval")
 		}
-		return c.compileExpr(arg0)
+		return c.compileNestedExpr(arg0)
 	default:
-		if !c.global.Interval.IsZero() {
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
 			return fmt.Errorf("aggregate function required inside the call to moving_average")
 		}
 		return c.compileSymbol("moving_average", arg0)
+	}
+}
+
+func (c *compiledField) compileExponentialMovingAverage(name string, args []influxql.Expr) error {
+	if got := len(args); got < 2 || got > 4 {
+		return fmt.Errorf("invalid number of arguments for %s, expected at least 2 but no more than 4, got %d", name, got)
+	}
+
+	arg1, ok := args[1].(*influxql.IntegerLiteral)
+	if !ok {
+		return fmt.Errorf("%s period must be an integer", name)
+	} else if arg1.Val < 1 {
+		return fmt.Errorf("%s period must be greater than or equal to 1", name)
+	}
+
+	if len(args) >= 3 {
+		switch arg2 := args[2].(type) {
+		case *influxql.IntegerLiteral:
+			if name == "triple_exponential_derivative" && arg2.Val < 1 && arg2.Val != -1 {
+				return fmt.Errorf("%s hold period must be greater than or equal to 1", name)
+			}
+			if arg2.Val < 0 && arg2.Val != -1 {
+				return fmt.Errorf("%s hold period must be greater than or equal to 0", name)
+			}
+		default:
+			return fmt.Errorf("%s hold period must be an integer", name)
+		}
+	}
+
+	if len(args) >= 4 {
+		switch arg3 := args[3].(type) {
+		case *influxql.StringLiteral:
+			switch arg3.Val {
+			case "exponential", "simple":
+			default:
+				return fmt.Errorf("%s warmup type must be one of: 'exponential' 'simple'", name)
+			}
+		default:
+			return fmt.Errorf("%s warmup type must be a string", name)
+		}
+	}
+
+	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < int(arg1.Val) {
+		c.global.ExtraIntervals = int(arg1.Val)
+	}
+
+	switch arg0 := args[0].(type) {
+	case *influxql.Call:
+		if c.global.Interval.IsZero() {
+			return fmt.Errorf("%s aggregate requires a GROUP BY interval", name)
+		}
+		return c.compileExpr(arg0)
+	default:
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
+			return fmt.Errorf("aggregate function required inside the call to %s", name)
+		}
+		return c.compileSymbol(name, arg0)
+	}
+}
+
+func (c *compiledField) compileKaufmans(name string, args []influxql.Expr) error {
+	if got := len(args); got < 2 || got > 3 {
+		return fmt.Errorf("invalid number of arguments for %s, expected at least 2 but no more than 3, got %d", name, got)
+	}
+
+	arg1, ok := args[1].(*influxql.IntegerLiteral)
+	if !ok {
+		return fmt.Errorf("%s period must be an integer", name)
+	} else if arg1.Val < 1 {
+		return fmt.Errorf("%s period must be greater than or equal to 1", name)
+	}
+
+	if len(args) >= 3 {
+		switch arg2 := args[2].(type) {
+		case *influxql.IntegerLiteral:
+			if arg2.Val < 0 && arg2.Val != -1 {
+				return fmt.Errorf("%s hold period must be greater than or equal to 0", name)
+			}
+		default:
+			return fmt.Errorf("%s hold period must be an integer", name)
+		}
+	}
+
+	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < int(arg1.Val) {
+		c.global.ExtraIntervals = int(arg1.Val)
+	}
+
+	switch arg0 := args[0].(type) {
+	case *influxql.Call:
+		if c.global.Interval.IsZero() {
+			return fmt.Errorf("%s aggregate requires a GROUP BY interval", name)
+		}
+		return c.compileExpr(arg0)
+	default:
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
+			return fmt.Errorf("aggregate function required inside the call to %s", name)
+		}
+		return c.compileSymbol(name, arg0)
+	}
+}
+
+func (c *compiledField) compileChandeMomentumOscillator(args []influxql.Expr) error {
+	if got := len(args); got < 2 || got > 4 {
+		return fmt.Errorf("invalid number of arguments for chande_momentum_oscillator, expected at least 2 but no more than 4, got %d", got)
+	}
+
+	arg1, ok := args[1].(*influxql.IntegerLiteral)
+	if !ok {
+		return fmt.Errorf("chande_momentum_oscillator period must be an integer")
+	} else if arg1.Val < 1 {
+		return fmt.Errorf("chande_momentum_oscillator period must be greater than or equal to 1")
+	}
+
+	if len(args) >= 3 {
+		switch arg2 := args[2].(type) {
+		case *influxql.IntegerLiteral:
+			if arg2.Val < 0 && arg2.Val != -1 {
+				return fmt.Errorf("chande_momentum_oscillator hold period must be greater than or equal to 0")
+			}
+		default:
+			return fmt.Errorf("chande_momentum_oscillator hold period must be an integer")
+		}
+	}
+
+	c.global.OnlySelectors = false
+	if c.global.ExtraIntervals < int(arg1.Val) {
+		c.global.ExtraIntervals = int(arg1.Val)
+	}
+
+	if len(args) >= 4 {
+		switch arg3 := args[3].(type) {
+		case *influxql.StringLiteral:
+			switch arg3.Val {
+			case "none", "exponential", "simple":
+			default:
+				return fmt.Errorf("chande_momentum_oscillator warmup type must be one of: 'none' 'exponential' 'simple'")
+			}
+		default:
+			return fmt.Errorf("chande_momentum_oscillator warmup type must be a string")
+		}
+	}
+
+	switch arg0 := args[0].(type) {
+	case *influxql.Call:
+		if c.global.Interval.IsZero() {
+			return fmt.Errorf("chande_momentum_oscillator aggregate requires a GROUP BY interval")
+		}
+		return c.compileExpr(arg0)
+	default:
+		if !c.global.Interval.IsZero() && !c.global.InheritedInterval {
+			return fmt.Errorf("aggregate function required inside the call to chande_momentum_oscillator")
+		}
+		return c.compileSymbol("chande_momentum_oscillator", arg0)
 	}
 }
 
@@ -602,7 +802,7 @@ func (c *compiledField) compileHoltWinters(args []influxql.Expr, withFit bool) e
 	} else if c.global.Interval.IsZero() {
 		return fmt.Errorf("%s aggregate requires a GROUP BY interval", name)
 	}
-	return c.compileExpr(call)
+	return c.compileNestedExpr(call)
 }
 
 func (c *compiledField) compileDistinct(args []influxql.Expr, nested bool) error {
@@ -668,11 +868,29 @@ func (c *compiledField) compileTopBottom(call *influxql.Call) error {
 	return nil
 }
 
-func (c *compiledField) compileTrigFunction(expr *influxql.Call) error {
-	if exp, got := 1, len(expr.Args); exp != got {
-		return fmt.Errorf("invalid number of arguments for %s, expected %d, got %d", expr.Name, exp, got)
+func (c *compiledField) compileMathFunction(expr *influxql.Call) error {
+	// How many arguments are we expecting?
+	nargs := 1
+	switch expr.Name {
+	case "atan2", "pow", "log":
+		nargs = 2
 	}
-	return c.compileExpr(expr.Args[0])
+
+	// Did we get the expected number of args?
+	if got := len(expr.Args); got != nargs {
+		return fmt.Errorf("invalid number of arguments for %s, expected %d, got %d", expr.Name, nargs, got)
+	}
+
+	// Compile all the argument expressions that are not just literals.
+	for _, arg := range expr.Args {
+		if _, ok := arg.(influxql.Literal); ok {
+			continue
+		}
+		if err := c.compileExpr(arg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *compiledStatement) compileDimensions(stmt *influxql.SelectStatement) error {
@@ -801,10 +1019,26 @@ func (c *compiledStatement) validateCondition(expr influxql.Expr) error {
 		if !isMathFunction(expr) {
 			return fmt.Errorf("invalid function call in condition: %s", expr)
 		}
-		if exp, got := 1, len(expr.Args); exp != got {
-			return fmt.Errorf("invalid number of arguments for %s, expected %d, got %d", expr.Name, exp, got)
+
+		// How many arguments are we expecting?
+		nargs := 1
+		switch expr.Name {
+		case "atan2", "pow":
+			nargs = 2
 		}
-		return c.validateCondition(expr.Args[0])
+
+		// Did we get the expected number of args?
+		if got := len(expr.Args); got != nargs {
+			return fmt.Errorf("invalid number of arguments for %s, expected %d, got %d", expr.Name, nargs, got)
+		}
+
+		// Are all the args valid?
+		for _, arg := range expr.Args {
+			if err := c.validateCondition(arg); err != nil {
+				return err
+			}
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -887,6 +1121,15 @@ func (c *compiledStatement) Prepare(shardMapper ShardMapper, sopt SelectOptions)
 			} else {
 				timeRange.Min = time.Unix(0, last-int64(interval)*int64(sopt.MaxBucketsN-1))
 			}
+		}
+	}
+
+	// Modify the time range if there are extra intervals and an interval.
+	if !c.Interval.IsZero() && c.ExtraIntervals > 0 {
+		if c.Ascending {
+			timeRange.Min = timeRange.Min.Add(time.Duration(-c.ExtraIntervals) * c.Interval.Duration)
+		} else {
+			timeRange.Max = timeRange.Max.Add(time.Duration(c.ExtraIntervals) * c.Interval.Duration)
 		}
 	}
 

@@ -69,7 +69,7 @@ second to sign our CLA, which can be found
 
 Installing Go
 -------------
-InfluxDB requires Go 1.9.2.
+InfluxDB requires Go 1.11.
 
 At InfluxDB we find gvm, a Go version manager, useful for installing Go. For instructions
 on how to install it see [the gvm page on github](https://github.com/moovweb/gvm).
@@ -77,8 +77,8 @@ on how to install it see [the gvm page on github](https://github.com/moovweb/gvm
 After installing gvm you can install and set the default go version by
 running the following:
 
-    gvm install go1.9.2
-    gvm use go1.9.2 --default
+    gvm install go1.11
+    gvm use go1.11 --default
 
 Installing Dep
 -------------
@@ -277,4 +277,6 @@ func BenchmarkSomething(b *testing.B) {
 
 Continuous Integration testing
 -----
-InfluxDB uses CircleCI for continuous integration testing. To see how the code is built and tested, check out [this file](https://github.com/influxdata/influxdb/blob/master/circle-test.sh). It closely follows the build and test process outlined above. You can see the exact version of Go InfluxDB uses for testing by consulting that file.
+InfluxDB uses CircleCI for continuous integration testing. CircleCI executes [test.sh](https://github.com/influxdata/influxdb/blob/master/test.sh), so you may do the same on your local development environment before creating a pull request.
+
+The `test.sh` script executes a test suite with 5 variants (standard 64 bit, 64 bit with race detection, 32 bit, TSI, go version 1.11), each executes with a different arg, 0 through 4. Unless you know differently, `./test.sh 0` is probably all you need.
